@@ -5,9 +5,14 @@ from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.models.glm4_moe import Glm4MoeForCausalLM
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM
 from atom.config import Config
-from atom.plugin.prepare import is_vllm, is_sglang
+from atom.plugin import prepare as plugin_prepare
+
+is_vllm = plugin_prepare.is_vllm
+is_sglang = plugin_prepare.is_sglang
+is_rtp = plugin_prepare.is_rtp
 
 logger = logging.getLogger("atom")
+
 
 _ATOM_SUPPORTED_MODELS = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
@@ -48,6 +53,30 @@ def register_ops_to_sglang(atom_config: Config) -> None:
     _register_custom_attention_to_sglang()
 
 
+def _register_custom_attention_to_rtp() -> None:
+    """Override RTP's built-in "aiter" backend with ATOM's implementation."""
+    from rtp_llm.srt.layers.attention.attention_registry import (
+        register_attention_backend,
+    )
+
+    logger.info("Register custom attention backend ATOMAttnBackendForRtp to RTP-LLM")
+
+    @register_attention_backend("aiter")
+    def create_atom_backend(runner):
+        from atom.plugin.rtp.attention_backend.rtp_attn_backend import (
+            ATOMAttnBackendForRtp,
+        )
+
+        return ATOMAttnBackendForRtp(runner)
+
+
+def register_ops_to_rtp(atom_config: Config) -> None:
+    """
+    Register custom ops to RTP-LLM, including attention backend.
+    """
+    _register_custom_attention_to_rtp()
+
+
 def set_attn_cls() -> None:
     """Swap ``atom.model_ops.Attention`` to the framework-appropriate class.
 
@@ -62,6 +91,13 @@ def set_attn_cls() -> None:
     elif is_sglang():
         ops.Attention = ops.RadixAttention
         logger.info("Set Attention to RadixAttention for SGLang")
+    elif is_rtp():
+        from atom.plugin.rtp.attention_backend.radix_attention import (
+            RadixAttention as RTPRadixAttention,
+        )
+
+        ops.Attention = RTPRadixAttention
+        logger.info("Set Attention to RadixAttention for RTP-LLM")
 
 
 def init_aiter_dist(config: Config) -> None:
@@ -104,6 +140,14 @@ def init_aiter_dist(config: Config) -> None:
         else:
             dp_master_ip = "127.0.0.1"
             dp_master_port = config.plugin_config.sglang_port_args.nccl_port
+    elif config.plugin_config.is_rtp:
+        if config.plugin_config.rtp_dist_init_addr is not None:
+            dp_master_ip, dp_master_port = (
+                config.plugin_config.rtp_dist_init_addr.split(":")
+            )
+        else:
+            dp_master_ip = "127.0.0.1"
+            dp_master_port = config.plugin_config.rtp_port_args.nccl_port
 
     distributed_init_method = get_distributed_init_method(dp_master_ip, dp_master_port)
 

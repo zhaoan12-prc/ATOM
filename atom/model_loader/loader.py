@@ -199,6 +199,9 @@ def load_model_in_plugin_mode(
         model_name_or_path = config.plugin_config.model_config.model
     elif config.plugin_config.is_sglang:
         model_name_or_path = config.plugin_config.model_config.model_path
+    elif config.plugin_config.is_rtp:
+        model_name_or_path = config.plugin_config.model_config.model_path
+
 
     _empty_cache()
     config_for_loading = (

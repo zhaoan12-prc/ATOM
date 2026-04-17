@@ -4,10 +4,10 @@ import logging
 logger = logging.getLogger("atom")
 
 # all of the supported frameworks, including server mode and plugin mode
-_SUPPORTED_FRAMEWORKS = ["vllm", "sglang", "sgl", "atom"]
+_SUPPORTED_FRAMEWORKS = ["vllm", "sglang", "sgl", "rtp", "rtp_llm", "atom"]
 
 # supported frameworks for plugin mode
-_SUPPORTED_FRAMEWORKS_FOR_PLUGIN_MODE = ["vllm", "sglang", "sgl"]
+_SUPPORTED_FRAMEWORKS_FOR_PLUGIN_MODE = ["vllm", "sglang", "sgl", "rtp", "rtp_llm"]
 
 # default is atom for server mode
 _CURRENT_FRAMEWORK = "atom"
@@ -21,6 +21,11 @@ def is_sglang() -> bool:
 def is_vllm() -> bool:
     global _CURRENT_FRAMEWORK
     return bool(_CURRENT_FRAMEWORK.lower() in ["vllm"])
+
+
+def is_rtp() -> bool:
+    global _CURRENT_FRAMEWORK
+    return bool(_CURRENT_FRAMEWORK.lower() in ["rtp", "rtp_llm"])
 
 
 def is_plugin_mode() -> bool:
@@ -37,13 +42,13 @@ def _set_framework_backbone(framework: str) -> None:
 
 def prepare_model(config: Any, engine: str):
     """
-    Prepare the model to upper framework SGLang
+    Prepare the model for upper framework plugin mode.
     """
     logger.info(f"Prepare model for plugin mode, the upper engine is {engine}")
 
     _set_framework_backbone(engine)
 
-    if is_sglang():
+    if is_sglang() or is_rtp():
         model_arch = config.architectures[0]
     else:
         raise ValueError(
@@ -56,6 +61,7 @@ def prepare_model(config: Any, engine: str):
         _ATOM_SUPPORTED_MODELS,
         # register_ops_to_vllm,
         register_ops_to_sglang,
+        register_ops_to_rtp,
         init_aiter_dist,
         set_attn_cls,
     )
@@ -76,6 +82,8 @@ def prepare_model(config: Any, engine: str):
 
     if is_sglang():
         register_ops_to_sglang(atom_config=atom_config)
+    elif is_rtp():
+        register_ops_to_rtp(atom_config=atom_config)
 
     set_attn_cls()
 

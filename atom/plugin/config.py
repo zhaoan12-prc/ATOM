@@ -17,6 +17,7 @@ class PluginConfig:
     is_plugin_mode: bool = False
     is_vllm: bool = False
     is_sglang: bool = False
+    is_rtp: bool = False
 
     # vllm specific
     vllm_config: Any = None
@@ -33,6 +34,15 @@ class PluginConfig:
     sglang_enable_dp_attention: bool = False
     sglang_dist_init_addr: Optional[str] = None
     sglang_port_args: Any = None
+
+    # rtp specific
+    rtp_model_opt_config: Any = None
+    rtp_load_config: Any = None
+    rtp_enable_torch_compile: bool = False
+    rtp_disable_cuda_graph: bool = False
+    rtp_enable_dp_attention: bool = False
+    rtp_dist_init_addr: Optional[str] = None
+    rtp_port_args: Any = None
 
 
 def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
@@ -66,6 +76,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         is_plugin_mode=True,
         is_vllm=True,
         is_sglang=False,
+        is_rtp=False,
         # vllm specific
         vllm_config=config,
         vllm_scheduler_config=vllm_scheduler_config,
@@ -189,6 +200,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         is_plugin_mode=True,
         is_vllm=False,
         is_sglang=True,
+        is_rtp=False,
         # sglang specific
         sglang_model_opt_config=sgl_model_opt_config,
         sglang_load_config=sgl_load_config,
@@ -228,6 +240,186 @@ def _generate_atom_config_from_sglang_config(config: Any):
     )
 
 
+def _generate_atom_config_from_rtp_config(config: Any):
+    from atom.config import Config, ParallelConfig, CompilationConfig
+
+    get_tensor_model_parallel_rank = None
+    get_global_server_args = None
+    PortArgs = None
+    RtpModelConfig = None
+    ModelOptConfig = None
+    LoadConfig = None
+    try:
+        from rtp_llm.srt.distributed import get_tensor_model_parallel_rank
+        from rtp_llm.srt.server_args import get_global_server_args, PortArgs
+        from rtp_llm.srt.configs.model_config import ModelConfig as RtpModelConfig
+        from rtp_llm.srt.configs.modelopt_config import ModelOptConfig
+        from rtp_llm.srt.configs.load_config import LoadConfig
+    except Exception:
+        # Keep fallback path for unit tests and environments where RTP Python
+        # package is not installed.
+        pass
+
+    server_args = None
+    if get_global_server_args is not None:
+        try:
+            server_args = get_global_server_args()
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to retrieve RTP-LLM global ServerArgs. Ensure this "
+                "function is called after RTP-LLM has initialized its server "
+                "arguments."
+            ) from exc
+
+        if server_args is None:
+            raise RuntimeError(
+                "RTP-LLM global ServerArgs are not initialized. Ensure this "
+                "function is called after RTP-LLM has parsed and set its "
+                "server arguments."
+            )
+    else:
+        server_args = config
+
+    model_path = getattr(server_args, "model_path", None)
+    if model_path is None:
+        model_path = getattr(server_args, "model", None)
+    if model_path is None:
+        raise RuntimeError(
+            "RTP global config is missing `model_path`/`model`. "
+            "Please ensure RTP server args are initialized before ATOM model loading."
+        )
+
+    if RtpModelConfig is not None:
+        rtp_model_config = RtpModelConfig.from_server_args(server_args)
+    else:
+        rtp_model_config = server_args
+
+    if ModelOptConfig is not None:
+        rtp_model_opt_config = ModelOptConfig(
+            quant=getattr(server_args, "modelopt_quant", None),
+            checkpoint_restore_path=getattr(
+                server_args, "modelopt_checkpoint_restore_path", None
+            ),
+            checkpoint_save_path=getattr(
+                server_args, "modelopt_checkpoint_save_path", None
+            ),
+            export_path=getattr(server_args, "modelopt_export_path", None),
+        )
+    else:
+        rtp_model_opt_config = None
+
+    if LoadConfig is not None:
+        rtp_load_config = LoadConfig(
+            load_format=getattr(server_args, "load_format", "auto"),
+            download_dir=getattr(server_args, "download_dir", None),
+            model_loader_extra_config=getattr(
+                server_args, "model_loader_extra_config", None
+            ),
+            remote_instance_weight_loader_seed_instance_ip=getattr(
+                server_args, "remote_instance_weight_loader_seed_instance_ip", None
+            ),
+            remote_instance_weight_loader_seed_instance_service_port=getattr(
+                server_args,
+                "remote_instance_weight_loader_seed_instance_service_port",
+                None,
+            ),
+            remote_instance_weight_loader_send_weights_group_ports=getattr(
+                server_args,
+                "remote_instance_weight_loader_send_weights_group_ports",
+                None,
+            ),
+            remote_instance_weight_loader_backend=getattr(
+                server_args, "remote_instance_weight_loader_backend", None
+            ),
+            modelopt_config=rtp_model_opt_config,
+            rl_quant_profile=getattr(server_args, "rl_quant_profile", None),
+        )
+    else:
+        rtp_load_config = None
+
+    tp_size = getattr(server_args, "tp_size", 1)
+    dp_size = getattr(server_args, "dp_size", 1)
+    ep_size = getattr(server_args, "ep_size", 1)
+    context_length = getattr(server_args, "context_length", 32768)
+    max_running_requests = getattr(server_args, "max_running_requests", 256)
+    mem_fraction_static = getattr(server_args, "mem_fraction_static", 0.9)
+    kv_cache_dtype = getattr(server_args, "kv_cache_dtype", "auto")
+    dist_init_addr = getattr(server_args, "dist_init_addr", None)
+    enable_torch_compile = bool(getattr(server_args, "enable_torch_compile", False))
+    disable_cuda_graph = bool(getattr(server_args, "disable_cuda_graph", False))
+    enable_dp_attention = bool(getattr(server_args, "enable_dp_attention", False))
+
+    # keep behavior aligned with sglang: prefer distributed rank if available
+    rank = int(getattr(server_args, "rank", 0))
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+
+    data_parallel_rank = int(getattr(server_args, "dp_rank", 0))
+    if dp_size > 1 and get_tensor_model_parallel_rank is not None:
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_group_size = max(1, tp_size // dp_size)
+        data_parallel_rank = tp_rank // tp_group_size
+
+    if PortArgs is not None:
+        rtp_port_args = PortArgs.init_new(server_args)
+    else:
+        # Keep shape-compatible object for init_aiter_dist fallback path/tests.
+        class _RtpPortArgs:
+            def __init__(self, nccl_port):
+                self.nccl_port = nccl_port
+
+        rtp_port_args = _RtpPortArgs(getattr(server_args, "nccl_port", 29500))
+
+    rtp_parallel_config = ParallelConfig(
+        data_parallel_size=dp_size,
+        data_parallel_rank=data_parallel_rank,
+    )
+
+    rtp_compilation_config = CompilationConfig(
+        level=0,
+        use_cudagraph=False,
+        cudagraph_mode=None,
+    )
+
+    plugin_config = PluginConfig(
+        model_config=rtp_model_config,
+        rank=rank,
+        is_plugin_mode=True,
+        is_vllm=False,
+        is_sglang=False,
+        is_rtp=True,
+        rtp_model_opt_config=rtp_model_opt_config,
+        rtp_load_config=rtp_load_config,
+        rtp_enable_torch_compile=enable_torch_compile,
+        rtp_disable_cuda_graph=disable_cuda_graph,
+        rtp_enable_dp_attention=enable_dp_attention,
+        rtp_dist_init_addr=dist_init_addr,
+        rtp_port_args=rtp_port_args,
+    )
+
+    return Config(
+        model=model_path,
+        max_num_batched_tokens=16384,
+        max_num_seqs=max_running_requests,
+        max_model_len=context_length,
+        gpu_memory_utilization=mem_fraction_static,
+        tensor_parallel_size=tp_size,
+        enforce_eager=True,
+        parallel_config=rtp_parallel_config,
+        kv_cache_dtype=kv_cache_dtype,
+        enable_prefix_caching=False,
+        port=None,
+        torch_profiler_dir=None,
+        compilation_config=rtp_compilation_config,
+        asyncio_mode=False,
+        load_dummy=False,
+        enable_expert_parallel=bool(ep_size > 1),
+        master_addr=None,
+        enable_dp_attention=enable_dp_attention,
+        plugin_config=plugin_config,
+    )
+
+
 def generate_atom_config_for_plugin_mode(config: Any = None):
     """
     Generate the atom config in plugin mode, be called when create the custom model
@@ -235,17 +427,21 @@ def generate_atom_config_for_plugin_mode(config: Any = None):
         - for vllm: config is VllmConfig and contains all config value from vllm
         - for sglang: config is only model specific config passed from sglang, so the
                       server args is used
+        - for rtp_llm: config can be RTP server args or model-specific config;
+                       global server args are preferred when available
     """
 
     logger.info("Generate atom config for plugin mode from passed config")
     atom_config = None
-    from atom.plugin import is_vllm, is_sglang
+    from atom.plugin import is_vllm, is_sglang, is_rtp
     from atom.config import set_current_atom_config
 
     if is_vllm():
         atom_config = _generate_atom_config_from_vllm_config(config)
     elif is_sglang():
         atom_config = _generate_atom_config_from_sglang_config(config)
+    elif is_rtp():
+        atom_config = _generate_atom_config_from_rtp_config(config)
     else:
         raise ValueError(
             "Make sure ATOM is running in plugin mode; "

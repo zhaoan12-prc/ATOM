@@ -1,0 +1,191 @@
+"""Tests for RTP OOT wrapper under mocked RTP deps."""
+
+import importlib
+import sys
+from types import ModuleType
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+class _Obj:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class _FakeLogitsProcessor:
+    def __init__(self, config):
+        self.config = config
+
+    def __call__(self, input_ids, hidden_states, lm_head, forward_batch):
+        return _Obj(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            lm_head=lm_head,
+            forward_batch=forward_batch,
+        )
+
+
+def _package(name: str) -> ModuleType:
+    module = ModuleType(name)
+    module.__path__ = []
+    return module
+
+
+def _make_fake_modules(*, is_last_rank: bool, setup_hook=None) -> dict[str, ModuleType]:
+    rtp_pkg = _package("rtp_llm")
+    srt_pkg = _package("rtp_llm.srt")
+    layers_pkg = _package("rtp_llm.srt.layers")
+    quant_pkg = _package("rtp_llm.srt.layers.quantization")
+    model_executor_pkg = _package("rtp_llm.srt.model_executor")
+
+    distributed_mod = ModuleType("rtp_llm.srt.distributed")
+    distributed_mod.get_pp_group = lambda: _Obj(is_last_rank=is_last_rank)
+
+    logits_mod = ModuleType("rtp_llm.srt.layers.logits_processor")
+    logits_mod.LogitsProcessor = _FakeLogitsProcessor
+    logits_mod.LogitsProcessorOutput = object
+
+    quant_base_mod = ModuleType("rtp_llm.srt.layers.quantization.base_config")
+    quant_base_mod.QuantizationConfig = object
+
+    forward_batch_mod = ModuleType("rtp_llm.srt.model_executor.forward_batch_info")
+    forward_batch_mod.ForwardBatch = object
+    forward_batch_mod.PPProxyTensors = object
+
+    attn_backend_pkg = _package("atom.plugin.rtp.attention_backend")
+    mla_mod = ModuleType("atom.plugin.rtp.attention_backend.rtp_attention_mla")
+    mla_mod.setup_deepseek_for_rtp = setup_hook or (lambda model: None)
+
+    return {
+        "rtp_llm": rtp_pkg,
+        "rtp_llm.srt": srt_pkg,
+        "rtp_llm.srt.distributed": distributed_mod,
+        "rtp_llm.srt.layers": layers_pkg,
+        "rtp_llm.srt.layers.logits_processor": logits_mod,
+        "rtp_llm.srt.layers.quantization": quant_pkg,
+        "rtp_llm.srt.layers.quantization.base_config": quant_base_mod,
+        "rtp_llm.srt.model_executor": model_executor_pkg,
+        "rtp_llm.srt.model_executor.forward_batch_info": forward_batch_mod,
+        "atom.plugin.rtp.attention_backend": attn_backend_pkg,
+        "atom.plugin.rtp.attention_backend.rtp_attention_mla": mla_mod,
+    }
+
+
+def _import_wrapper_module(
+    monkeypatch, fake_model, *, is_last_rank=False, setup_hook=None
+):
+    import atom
+
+    monkeypatch.setattr(
+        atom,
+        "prepare_model",
+        MagicMock(return_value=fake_model),
+        raising=False,
+    )
+
+    fake_modules = _make_fake_modules(
+        is_last_rank=is_last_rank,
+        setup_hook=setup_hook,
+    )
+    patcher = patch.dict(sys.modules, fake_modules)
+    patcher.start()
+    sys.modules.pop("atom.plugin.rtp.models.base_model_wrapper", None)
+    module = importlib.import_module("atom.plugin.rtp.models.base_model_wrapper")
+    module = importlib.reload(module)
+    return module, patcher
+
+
+def test_qwen_wrapper_calls_prepare_model_with_rtp_engine(monkeypatch):
+    fake_model = MagicMock(return_value="hidden_states")
+    fake_model.lm_head = object()
+
+    module, patcher = _import_wrapper_module(
+        monkeypatch,
+        fake_model,
+        is_last_rank=False,
+    )
+    try:
+        wrapper = module.Qwen3MoeForCausalLM(
+            _Obj(vocab_size=32000, architectures=["Qwen3MoeForCausalLM"])
+        )
+        forward_batch = _Obj(tag="fb")
+        pp_proxy_tensors = _Obj(hidden_states="hs", residual="res")
+
+        result = wrapper.forward(
+            input_ids="input_ids",
+            positions="positions",
+            forward_batch=forward_batch,
+            input_embeds="input_embeds",
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+    finally:
+        patcher.stop()
+
+    assert result == "hidden_states"
+    fake_model.assert_called_once_with(
+        input_ids="input_ids",
+        positions="positions",
+        intermediate_tensors=pp_proxy_tensors,
+        inputs_embeds="input_embeds",
+        forward_batch=forward_batch,
+        get_embedding=False,
+        pp_proxy_tensors=pp_proxy_tensors,
+    )
+
+
+def test_qwen_wrapper_last_rank_returns_logits_output(monkeypatch):
+    fake_model = MagicMock(return_value="hidden_states")
+    fake_model.lm_head = object()
+
+    module, patcher = _import_wrapper_module(
+        monkeypatch,
+        fake_model,
+        is_last_rank=True,
+    )
+    try:
+        wrapper = module.Qwen3MoeForCausalLM(
+            _Obj(vocab_size=32000, architectures=["Qwen3MoeForCausalLM"])
+        )
+        forward_batch = _Obj(tag="fb")
+
+        result = wrapper.forward(
+            input_ids="input_ids",
+            positions="positions",
+            forward_batch=forward_batch,
+        )
+    finally:
+        patcher.stop()
+
+    assert result.input_ids == "input_ids"
+    assert result.hidden_states == "hidden_states"
+    assert result.lm_head is fake_model.lm_head
+    assert result.forward_batch is forward_batch
+
+
+def test_deepseek_wrapper_resets_forward_batch_context_on_exception(monkeypatch):
+    fake_model = MagicMock(side_effect=RuntimeError("boom"))
+    fake_model.lm_head = object()
+
+    module, patcher = _import_wrapper_module(
+        monkeypatch,
+        fake_model,
+        is_last_rank=False,
+    )
+    try:
+        wrapper = module.DeepseekV3ForCausalLM(
+            _Obj(vocab_size=32000, architectures=["DeepseekV3ForCausalLM"])
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            wrapper.forward(
+                input_ids="input_ids",
+                positions="positions",
+                forward_batch=_Obj(tag="fb"),
+            )
+    finally:
+        patcher.stop()
+
+    assert module.get_current_forward_batch() is None
+
