@@ -97,6 +97,28 @@ def test_init_aiter_dist_rtp_with_dist_init_addr():
     )
 
 
+def test_init_aiter_dist_rtp_without_dist_init_addr():
+    config = _Obj(
+        tensor_parallel_size=4,
+        plugin_config=_Obj(
+            is_plugin_mode=True,
+            is_rtp=True,
+            rank=0,
+            rtp_dist_init_addr=None,
+            rtp_port_args=_Obj(nccl_port=31000),
+        ),
+        parallel_config=_Obj(data_parallel_size=1, data_parallel_rank=0),
+    )
+
+    mock_init_dist_env = MagicMock()
+    mock_get_method = MagicMock(return_value="tcp://127.0.0.1:31000")
+
+    _run_init_aiter_dist(config, mock_init_dist_env, mock_get_method)
+
+    mock_get_method.assert_called_once_with("127.0.0.1", 31000)
+    mock_init_dist_env.assert_called_once()
+
+
 def test_register_custom_attention_to_rtp_uses_aiter_name():
     def _package(name: str) -> ModuleType:
         module = ModuleType(name)
@@ -136,6 +158,7 @@ def test_register_custom_attention_to_rtp_uses_aiter_name():
         "rtp_llm.srt.layers.attention.attention_registry": fake_attention_registry,
         "atom.models.qwen3": ModuleType("atom.models.qwen3"),
         "atom.models.qwen3_moe": ModuleType("atom.models.qwen3_moe"),
+        "atom.models.qwen3_5": ModuleType("atom.models.qwen3_5"),
         "atom.models.glm4_moe": ModuleType("atom.models.glm4_moe"),
         "atom.models.deepseek_v2": ModuleType("atom.models.deepseek_v2"),
         "atom.config": ModuleType("atom.config"),
@@ -147,6 +170,16 @@ def test_register_custom_attention_to_rtp_uses_aiter_name():
     fake_modules["atom.models.qwen3"].Qwen3ForCausalLM = type("Qwen3ForCausalLM", (), {})
     fake_modules["atom.models.qwen3_moe"].Qwen3MoeForCausalLM = type(
         "Qwen3MoeForCausalLM", (), {}
+    )
+    fake_modules[
+        "atom.models.qwen3_5"
+    ].Qwen3_5ForConditionalGenerationTextOnly = type(
+        "Qwen3_5ForConditionalGenerationTextOnly", (), {}
+    )
+    fake_modules[
+        "atom.models.qwen3_5"
+    ].Qwen3_5MoeForConditionalGenerationTextOnly = type(
+        "Qwen3_5MoeForConditionalGenerationTextOnly", (), {}
     )
     fake_modules["atom.models.glm4_moe"].Glm4MoeForCausalLM = type(
         "Glm4MoeForCausalLM", (), {}

@@ -164,6 +164,52 @@ def test_qwen_wrapper_last_rank_returns_logits_output(monkeypatch):
     assert result.forward_batch is forward_batch
 
 
+def test_deepseek_wrapper_sets_and_clears_forward_batch_context(monkeypatch):
+    captured = {}
+
+    def _forward_impl(**kwargs):
+        captured["current_forward_batch"] = module.get_current_forward_batch()
+        captured["kwargs"] = kwargs
+        return "hidden_states"
+
+    fake_model = MagicMock(side_effect=_forward_impl)
+    fake_model.lm_head = object()
+    setup_hook = MagicMock()
+
+    module, patcher = _import_wrapper_module(
+        monkeypatch,
+        fake_model,
+        is_last_rank=False,
+        setup_hook=setup_hook,
+    )
+    try:
+        wrapper = module.DeepseekV3ForCausalLM(
+            _Obj(vocab_size=32000, architectures=["DeepseekV3ForCausalLM"])
+        )
+        forward_batch = _Obj(tag="fb")
+        pp_proxy_tensors = _Obj(hidden_states="hs", residual="res")
+
+        result = wrapper.forward(
+            input_ids="input_ids",
+            positions="positions",
+            forward_batch=forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+    finally:
+        patcher.stop()
+
+    setup_hook.assert_called_once_with(fake_model)
+    assert result == "hidden_states"
+    assert captured["current_forward_batch"] is forward_batch
+    assert captured["kwargs"] == {
+        "input_ids": "input_ids",
+        "positions": "positions",
+        "intermediate_tensors": pp_proxy_tensors,
+        "inputs_embeds": None,
+    }
+    assert module.get_current_forward_batch() is None
+
+
 def test_deepseek_wrapper_resets_forward_batch_context_on_exception(monkeypatch):
     fake_model = MagicMock(side_effect=RuntimeError("boom"))
     fake_model.lm_head = object()
@@ -188,4 +234,22 @@ def test_deepseek_wrapper_resets_forward_batch_context_on_exception(monkeypatch)
         patcher.stop()
 
     assert module.get_current_forward_batch() is None
+
+
+def test_rtp_wrapper_entryclass_includes_qwen35(monkeypatch):
+    fake_model = MagicMock(return_value="hidden_states")
+    fake_model.lm_head = object()
+
+    module, patcher = _import_wrapper_module(
+        monkeypatch,
+        fake_model,
+        is_last_rank=False,
+    )
+    try:
+        entry_names = {cls.__name__ for cls in module.EntryClass}
+    finally:
+        patcher.stop()
+
+    assert "Qwen3_5ForConditionalGeneration" in entry_names
+    assert "Qwen3_5MoeForConditionalGeneration" in entry_names
 

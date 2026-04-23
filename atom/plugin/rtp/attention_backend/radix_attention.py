@@ -2,9 +2,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # Adapter for models in rtp plugin mode.
-# Wraps RTP's native RadixAttention behind ATOM's BaseAttention interface.
+# Wraps RTP's native RadixAttention behind ATOM's BaseAttention interface,
+# handling rope application and forward_batch dispatch.
+#
+# TODO: Rewrite this file once RTP's attention flow is unified into ATOM's
+# attention layer
 
-import importlib
 from typing import Optional
 
 import torch
@@ -17,25 +20,12 @@ from atom.models.utils import maybe_prefix
 from atom.plugin.prepare import is_plugin_mode, is_rtp
 
 
-def _import_rtp_radix_attention():
-    candidates = (
-        "rtp_llm.srt.layers.radix_attention",
-        "rtp_llm.layers.radix_attention",
-    )
-    for module_name in candidates:
-        try:
-            mod = importlib.import_module(module_name)
-            return mod.RadixAttention
-        except Exception:
-            continue
-    raise ImportError(
-        "Failed to import RTP-LLM RadixAttention from known module paths: "
-        f"{candidates}"
-    )
-
-
 class RadixAttention(BaseAttention):
-    """Attention wrapper for RTP plugin mode."""
+    """Attention wrapper for RTP plugin mode.
+
+    Delegates to RTP's RadixAttention internally, adapting ATOM's attention
+    interface to RTP's forward_batch-based API.
+    """
 
     def __init__(
         self,
@@ -72,7 +62,7 @@ class RadixAttention(BaseAttention):
         self.rotary_emb = rotary_emb
 
         if is_rtp():
-            RTPRadixAttention = _import_rtp_radix_attention()
+            from rtp_llm.srt.layers.radix_attention import RadixAttention
 
             explicit_v_head_dim = kwargs.get("v_head_dim", None)
             if explicit_v_head_dim is not None:
@@ -82,7 +72,7 @@ class RadixAttention(BaseAttention):
             else:
                 _v_head_dim = head_dim
 
-            self.attn = RTPRadixAttention(
+            self.attn = RadixAttention(
                 num_heads=num_heads,
                 head_dim=head_dim,
                 scaling=scale,
@@ -99,9 +89,12 @@ class RadixAttention(BaseAttention):
                 self.attn.v_scale = atom_parameter(
                     torch.tensor([1.0], dtype=torch.float32, device="cuda")
                 )
-            if getattr(self.attn, "k_scale_float", None) is None:
+            # Some RTP attention backends consume the host-side float scales
+            # directly. Keep them in sync with the device-side defaults so the
+            # plugin path works even when checkpoint loading never populates them.
+            if self.attn.k_scale_float is None:
                 self.attn.k_scale_float = 1.0
-            if getattr(self.attn, "v_scale_float", None) is None:
+            if self.attn.v_scale_float is None:
                 self.attn.v_scale_float = 1.0
         else:
             raise NotImplementedError(

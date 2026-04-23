@@ -64,6 +64,36 @@ def test_prepare_model_rtp_happy_path():
     assert result is fake_model
 
 
+def test_prepare_model_rtp_llm_alias_happy_path():
+    fake_atom_config = _Obj(plugin_config=_Obj(is_plugin_mode=True))
+    fake_model = MagicMock(name="FakeRtpModelAlias")
+    fake_model_cls = MagicMock(return_value=fake_model)
+
+    fake_register = _make_fake_register_module(
+        model_dict={"Qwen3ForCausalLM": fake_model_cls}
+    )
+    mock_gen_config = MagicMock(return_value=fake_atom_config)
+    fake_config_mod = MagicMock()
+    fake_config_mod.generate_atom_config_for_plugin_mode = mock_gen_config
+
+    with patch.dict(
+        sys.modules,
+        {
+            "atom.plugin.register": fake_register,
+            "atom.plugin.config": fake_config_mod,
+        },
+    ):
+        config = _Obj(architectures=["Qwen3ForCausalLM"])
+        result = plugin_prepare.prepare_model(config=config, engine="rtp_llm")
+
+    mock_gen_config.assert_called_once_with(config)
+    fake_register.register_ops_to_rtp.assert_called_once_with(
+        atom_config=fake_atom_config
+    )
+    fake_model_cls.assert_called_once_with(atom_config=fake_atom_config)
+    assert result is fake_model
+
+
 def test_prepare_model_rtp_rejects_unsupported_architecture():
     fake_register = _make_fake_register_module(
         model_dict={"DeepseekV3ForCausalLM": MagicMock()}
@@ -73,4 +103,30 @@ def test_prepare_model_rtp_rejects_unsupported_architecture():
         config = _Obj(architectures=["TotallyFakeModelArch"])
         with pytest.raises(ValueError, match="does not support"):
             plugin_prepare.prepare_model(config=config, engine="rtp")
+
+
+def test_prepare_model_sets_framework_to_rtp():
+    fake_atom_config = _Obj(plugin_config=_Obj(is_plugin_mode=True))
+    fake_model_cls = MagicMock(return_value=MagicMock())
+
+    fake_register = _make_fake_register_module(
+        model_dict={"DeepseekV3ForCausalLM": fake_model_cls}
+    )
+    fake_config_mod = MagicMock()
+    fake_config_mod.generate_atom_config_for_plugin_mode = MagicMock(
+        return_value=fake_atom_config
+    )
+
+    with patch.dict(
+        sys.modules,
+        {
+            "atom.plugin.register": fake_register,
+            "atom.plugin.config": fake_config_mod,
+        },
+    ):
+        config = _Obj(architectures=["DeepseekV3ForCausalLM"])
+        plugin_prepare.prepare_model(config=config, engine="rtp")
+
+    assert plugin_prepare.is_rtp() is True
+    assert plugin_prepare.is_plugin_mode() is True
 

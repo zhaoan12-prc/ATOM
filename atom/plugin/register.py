@@ -2,6 +2,10 @@ import logging
 
 from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
+from atom.models.qwen3_5 import (
+    Qwen3_5ForConditionalGenerationTextOnly,
+    Qwen3_5MoeForConditionalGenerationTextOnly,
+)
 from atom.models.glm4_moe import Glm4MoeForCausalLM
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM
 from atom.config import Config
@@ -17,6 +21,8 @@ logger = logging.getLogger("atom")
 _ATOM_SUPPORTED_MODELS = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
+    "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationTextOnly,
+    "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGenerationTextOnly,
     "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
 }

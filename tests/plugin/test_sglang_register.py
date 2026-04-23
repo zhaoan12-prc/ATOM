@@ -322,6 +322,7 @@ def test_register_custom_attention_uses_aiter_name():
         "sglang.srt.layers.attention.attention_registry": fake_attention_registry,
         "atom.models.qwen3": ModuleType("atom.models.qwen3"),
         "atom.models.qwen3_moe": ModuleType("atom.models.qwen3_moe"),
+        "atom.models.qwen3_5": ModuleType("atom.models.qwen3_5"),
         "atom.models.glm4_moe": ModuleType("atom.models.glm4_moe"),
         "atom.models.deepseek_v2": ModuleType("atom.models.deepseek_v2"),
         "atom.config": ModuleType("atom.config"),
@@ -335,6 +336,16 @@ def test_register_custom_attention_uses_aiter_name():
     )
     fake_modules["atom.models.qwen3_moe"].Qwen3MoeForCausalLM = type(
         "Qwen3MoeForCausalLM", (), {}
+    )
+    fake_modules[
+        "atom.models.qwen3_5"
+    ].Qwen3_5ForConditionalGenerationTextOnly = type(
+        "Qwen3_5ForConditionalGenerationTextOnly", (), {}
+    )
+    fake_modules[
+        "atom.models.qwen3_5"
+    ].Qwen3_5MoeForConditionalGenerationTextOnly = type(
+        "Qwen3_5MoeForConditionalGenerationTextOnly", (), {}
     )
     fake_modules["atom.models.glm4_moe"].Glm4MoeForCausalLM = type(
         "Glm4MoeForCausalLM", (), {}

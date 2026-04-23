@@ -240,3 +240,21 @@ def test_deepseek_wrapper_resets_forward_batch_context_on_exception(monkeypatch)
         patcher.stop()
 
     assert module.get_current_forward_batch() is None
+
+
+def test_sglang_wrapper_entryclass_includes_qwen35(monkeypatch):
+    fake_model = MagicMock(return_value="hidden_states")
+    fake_model.lm_head = object()
+
+    module, patcher = _import_wrapper_module(
+        monkeypatch,
+        fake_model,
+        is_last_rank=False,
+    )
+    try:
+        entry_names = {cls.__name__ for cls in module.EntryClass}
+    finally:
+        patcher.stop()
+
+    assert "Qwen3_5ForConditionalGeneration" in entry_names
+    assert "Qwen3_5MoeForConditionalGeneration" in entry_names

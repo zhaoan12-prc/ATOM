@@ -241,140 +241,86 @@ def _generate_atom_config_from_sglang_config(config: Any):
 
 
 def _generate_atom_config_from_rtp_config(config: Any):
+    from rtp_llm.srt.distributed import get_tensor_model_parallel_rank
+    from rtp_llm.srt.server_args import (
+        get_global_server_args,
+        PortArgs,
+    )
+    from rtp_llm.srt.configs.model_config import ModelConfig as RtpModelConfig
+    from rtp_llm.srt.configs.modelopt_config import ModelOptConfig
+    from rtp_llm.srt.configs.load_config import LoadConfig
     from atom.config import Config, ParallelConfig, CompilationConfig
 
-    get_tensor_model_parallel_rank = None
-    get_global_server_args = None
-    PortArgs = None
-    RtpModelConfig = None
-    ModelOptConfig = None
-    LoadConfig = None
+    # RTP's ModelRunner already parsed and stored ServerArgs globally before
+    # OOT model loading, so we can retrieve it directly.
     try:
-        from rtp_llm.srt.distributed import get_tensor_model_parallel_rank
-        from rtp_llm.srt.server_args import get_global_server_args, PortArgs
-        from rtp_llm.srt.configs.model_config import ModelConfig as RtpModelConfig
-        from rtp_llm.srt.configs.modelopt_config import ModelOptConfig
-        from rtp_llm.srt.configs.load_config import LoadConfig
-    except Exception:
-        # Keep fallback path for unit tests and environments where RTP Python
-        # package is not installed.
-        pass
+        server_args = get_global_server_args()
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to retrieve RTP-LLM global ServerArgs. Ensure this "
+            "function is called after RTP-LLM has initialized its server "
+            "arguments."
+        ) from exc
 
-    server_args = None
-    if get_global_server_args is not None:
-        try:
-            server_args = get_global_server_args()
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to retrieve RTP-LLM global ServerArgs. Ensure this "
-                "function is called after RTP-LLM has initialized its server "
-                "arguments."
-            ) from exc
-
-        if server_args is None:
-            raise RuntimeError(
-                "RTP-LLM global ServerArgs are not initialized. Ensure this "
-                "function is called after RTP-LLM has parsed and set its "
-                "server arguments."
-            )
-    else:
+    # Keep a minimal fallback for unit tests when RTP global args are absent.
+    if server_args is None:
         server_args = config
+    if server_args is None:
+        raise RuntimeError(
+            "RTP-LLM global ServerArgs are not initialized. Ensure this "
+            "function is called after RTP-LLM has parsed and set its "
+            "server arguments."
+        )
 
-    model_path = getattr(server_args, "model_path", None)
-    if model_path is None:
-        model_path = getattr(server_args, "model", None)
+    model_path = (
+        server_args.model_path
+        if hasattr(server_args, "model_path")
+        else getattr(server_args, "model", None)
+    )
     if model_path is None:
         raise RuntimeError(
             "RTP global config is missing `model_path`/`model`. "
             "Please ensure RTP server args are initialized before ATOM model loading."
         )
 
-    if RtpModelConfig is not None:
-        rtp_model_config = RtpModelConfig.from_server_args(server_args)
-    else:
-        rtp_model_config = server_args
+    rtp_model_config = RtpModelConfig.from_server_args(server_args)
+    rtp_model_opt_config = ModelOptConfig(
+        quant=server_args.modelopt_quant,
+        checkpoint_restore_path=server_args.modelopt_checkpoint_restore_path,
+        checkpoint_save_path=server_args.modelopt_checkpoint_save_path,
+        export_path=server_args.modelopt_export_path,
+    )
+    rtp_load_config = LoadConfig(
+        load_format=server_args.load_format,
+        download_dir=server_args.download_dir,
+        model_loader_extra_config=server_args.model_loader_extra_config,
+        remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
+        remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
+        remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
+        remote_instance_weight_loader_backend=server_args.remote_instance_weight_loader_backend,
+        modelopt_config=rtp_model_opt_config,
+        rl_quant_profile=server_args.rl_quant_profile,
+    )
 
-    if ModelOptConfig is not None:
-        rtp_model_opt_config = ModelOptConfig(
-            quant=getattr(server_args, "modelopt_quant", None),
-            checkpoint_restore_path=getattr(
-                server_args, "modelopt_checkpoint_restore_path", None
-            ),
-            checkpoint_save_path=getattr(
-                server_args, "modelopt_checkpoint_save_path", None
-            ),
-            export_path=getattr(server_args, "modelopt_export_path", None),
-        )
-    else:
-        rtp_model_opt_config = None
+    # RTP does not pass rank via the model config path, so ATOM plugin gets it
+    # from torch.distributed.
+    rank = torch.distributed.get_rank()
 
-    if LoadConfig is not None:
-        rtp_load_config = LoadConfig(
-            load_format=getattr(server_args, "load_format", "auto"),
-            download_dir=getattr(server_args, "download_dir", None),
-            model_loader_extra_config=getattr(
-                server_args, "model_loader_extra_config", None
-            ),
-            remote_instance_weight_loader_seed_instance_ip=getattr(
-                server_args, "remote_instance_weight_loader_seed_instance_ip", None
-            ),
-            remote_instance_weight_loader_seed_instance_service_port=getattr(
-                server_args,
-                "remote_instance_weight_loader_seed_instance_service_port",
-                None,
-            ),
-            remote_instance_weight_loader_send_weights_group_ports=getattr(
-                server_args,
-                "remote_instance_weight_loader_send_weights_group_ports",
-                None,
-            ),
-            remote_instance_weight_loader_backend=getattr(
-                server_args, "remote_instance_weight_loader_backend", None
-            ),
-            modelopt_config=rtp_model_opt_config,
-            rl_quant_profile=getattr(server_args, "rl_quant_profile", None),
-        )
-    else:
-        rtp_load_config = None
-
-    tp_size = getattr(server_args, "tp_size", 1)
-    dp_size = getattr(server_args, "dp_size", 1)
-    ep_size = getattr(server_args, "ep_size", 1)
-    context_length = getattr(server_args, "context_length", 32768)
-    max_running_requests = getattr(server_args, "max_running_requests", 256)
-    mem_fraction_static = getattr(server_args, "mem_fraction_static", 0.9)
-    kv_cache_dtype = getattr(server_args, "kv_cache_dtype", "auto")
-    dist_init_addr = getattr(server_args, "dist_init_addr", None)
-    enable_torch_compile = bool(getattr(server_args, "enable_torch_compile", False))
-    disable_cuda_graph = bool(getattr(server_args, "disable_cuda_graph", False))
-    enable_dp_attention = bool(getattr(server_args, "enable_dp_attention", False))
-
-    # keep behavior aligned with sglang: prefer distributed rank if available
-    rank = int(getattr(server_args, "rank", 0))
-    if torch.distributed.is_initialized():
-        rank = torch.distributed.get_rank()
-
-    data_parallel_rank = int(getattr(server_args, "dp_rank", 0))
-    if dp_size > 1 and get_tensor_model_parallel_rank is not None:
+    # Derive DP rank from RTP's TP-local rank rather than global distributed
+    # rank so PP/multi-stage layouts do not skew the result.
+    data_parallel_rank = 0
+    if server_args.dp_size > 1:
         tp_rank = get_tensor_model_parallel_rank()
-        tp_group_size = max(1, tp_size // dp_size)
+        tp_group_size = max(1, server_args.tp_size // server_args.dp_size)
         data_parallel_rank = tp_rank // tp_group_size
 
-    if PortArgs is not None:
-        rtp_port_args = PortArgs.init_new(server_args)
-    else:
-        # Keep shape-compatible object for init_aiter_dist fallback path/tests.
-        class _RtpPortArgs:
-            def __init__(self, nccl_port):
-                self.nccl_port = nccl_port
-
-        rtp_port_args = _RtpPortArgs(getattr(server_args, "nccl_port", 29500))
-
     rtp_parallel_config = ParallelConfig(
-        data_parallel_size=dp_size,
+        data_parallel_size=server_args.dp_size,
         data_parallel_rank=data_parallel_rank,
     )
 
+    # Use RTP torch compile policy and cuda graph policy because RTP owns the
+    # compile/graph path in plugin mode.
     rtp_compilation_config = CompilationConfig(
         level=0,
         use_cudagraph=False,
@@ -390,32 +336,32 @@ def _generate_atom_config_from_rtp_config(config: Any):
         is_rtp=True,
         rtp_model_opt_config=rtp_model_opt_config,
         rtp_load_config=rtp_load_config,
-        rtp_enable_torch_compile=enable_torch_compile,
-        rtp_disable_cuda_graph=disable_cuda_graph,
-        rtp_enable_dp_attention=enable_dp_attention,
-        rtp_dist_init_addr=dist_init_addr,
-        rtp_port_args=rtp_port_args,
+        rtp_enable_torch_compile=server_args.enable_torch_compile,
+        rtp_disable_cuda_graph=server_args.disable_cuda_graph,
+        rtp_enable_dp_attention=server_args.enable_dp_attention,
+        rtp_dist_init_addr=server_args.dist_init_addr,
+        rtp_port_args=PortArgs.init_new(server_args),
     )
 
     return Config(
         model=model_path,
         max_num_batched_tokens=16384,
-        max_num_seqs=max_running_requests,
-        max_model_len=context_length,
-        gpu_memory_utilization=mem_fraction_static,
-        tensor_parallel_size=tp_size,
+        max_num_seqs=server_args.max_running_requests,
+        max_model_len=server_args.context_length,
+        gpu_memory_utilization=server_args.mem_fraction_static,
+        tensor_parallel_size=server_args.tp_size,
         enforce_eager=True,
         parallel_config=rtp_parallel_config,
-        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_dtype=server_args.kv_cache_dtype,
         enable_prefix_caching=False,
         port=None,
         torch_profiler_dir=None,
         compilation_config=rtp_compilation_config,
         asyncio_mode=False,
         load_dummy=False,
-        enable_expert_parallel=bool(ep_size > 1),
+        enable_expert_parallel=bool(server_args.ep_size > 1),
         master_addr=None,
-        enable_dp_attention=enable_dp_attention,
+        enable_dp_attention=server_args.enable_dp_attention,
         plugin_config=plugin_config,
     )
 

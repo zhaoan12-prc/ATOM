@@ -36,7 +36,7 @@ from atom.model_ops.moe import (
 from aiter.dist.parallel_state import get_tp_group
 from atom.models.qwen3_next_mtp import remap_mtp_weight_name
 
-from atom.plugin.prepare import is_sglang
+from atom.plugin.prepare import is_rtp, is_sglang
 
 logger = logging.getLogger("atom")
 
@@ -530,9 +530,11 @@ def load_model(
             module.process_weights_after_loading()
         quant_method = getattr(module, "quant_method", None)
 
-        # when running plugin mode for sglang, don't do the post process here
-        # since sglang will call this func automatically after finishing loading
-        if isinstance(quant_method, QuantizeMethodBase) and not is_sglang():
+        # when running plugin mode for sglang/rtp, don't do the post process
+        # here since upper framework will call this automatically after loading
+        if isinstance(quant_method, QuantizeMethodBase) and not (
+            is_sglang() or is_rtp()
+        ):
             quant_method.process_weights_after_loading(module)
         if isinstance(quant_method, FusedMoEMethodBase):
             quant_method.init_prepare_finalize(module)
