@@ -177,6 +177,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.num_experts
+        self.n_shared_experts = getattr(config, "n_shared_experts", 0)
 
         # self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
@@ -202,14 +203,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         self.gate = MergedReplicatedLinear(
             config.hidden_size,
-            [config.num_experts, config.n_shared_experts],
+            [config.num_experts, self.n_shared_experts],
             bias=False,
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
         # print(f"layer {prefix}, gate weight: {self.gate.weight.data}", flush=True)
-
-        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
         if (
             config.shared_expert_intermediate_size > 0
@@ -221,7 +220,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
-                expert_gate=self.shared_expert_gate,
                 prefix=f"{prefix}.shared_expert",
             )
         else:
@@ -252,11 +250,22 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        routed_output = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
-        if not is_rocm_aiter_fusion_shared_expert_enabled():
+        shared_expert_gate_logits = None
+        if self.shared_expert is not None and self.n_shared_experts > 0:
+            router_logits, shared_expert_gate_logits = torch.split(
+                router_logits,
+                [self.n_routed_experts, self.n_shared_experts],
+                dim=-1,
+            )
+
+        routed_output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        if (
+            not is_rocm_aiter_fusion_shared_expert_enabled()
+            and self.shared_expert is not None
+        ):
             shared_output = self.shared_expert(hidden_states)
+            if shared_expert_gate_logits is not None:
+                shared_output = torch.sigmoid(shared_expert_gate_logits) * shared_output
             final_hidden_states = shared_output + routed_output
         else:
             final_hidden_states = routed_output
