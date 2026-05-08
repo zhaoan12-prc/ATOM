@@ -84,7 +84,11 @@ def set_attn_cls() -> None:
         ops.Attention = ops.RadixAttention
         logger.info("Set Attention to RadixAttention for SGLang")
     elif is_rtpllm():
-        logger.info("Keep Attention backend unchanged for rtp-llm")
+        from atom.plugin.rtpllm.attention_backend import RTPAttention
+
+        ops.RTPAttention = RTPAttention
+        ops.Attention = RTPAttention
+        logger.info("Set Attention to RTPAttention for rtp-llm")
 
 
 def init_aiter_dist(config: Config) -> None:

@@ -81,7 +81,6 @@ def prepare_model(config: Any, engine: str):
     model_cls = _ATOM_SUPPORTED_MODELS[model_arch]
     logger.info(f"ATOM model class for {model_arch} is {model_cls}")
 
-<<<<<<< HEAD
     if is_sglang() and model_arch in {
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
