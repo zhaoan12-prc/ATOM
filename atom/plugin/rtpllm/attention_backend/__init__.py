@@ -5,6 +5,7 @@ from .rtp_mla_metadata import (
     GLM5_RTP_OWNERSHIP,
     RTPMlaPluginMetadata,
 )
+from .rtp_sparse_mla_backend import RTPSparseMlaBackend
 
 
 def __getattr__(name):
@@ -26,6 +27,7 @@ __all__ = [
     "RTPAttention",
     "RTPFullAttention",
     "RTPMLAAttention",
+    "RTPSparseMlaBackend",
     "GLM5_RTP_BRIDGE_MODE",
     "GLM5_RTP_BRIDGE_MODE_M0_DENSE",
     "GLM5_RTP_OWNERSHIP",

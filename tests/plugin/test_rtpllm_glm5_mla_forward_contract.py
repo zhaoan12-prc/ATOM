@@ -10,6 +10,14 @@ import torch
 from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
 
 
+_FORBIDDEN_CUDA_SPARSE_MODULES = (
+    "flashmla_sparse",
+    "flash_mla",
+    "sparse_mla",
+    "attention_mla_sparse",
+)
+
+
 class _FakeDenseBackend:
     def __init__(self, v_head_dim: int):
         self.v_head_dim = v_head_dim
@@ -60,7 +68,7 @@ def _guard_sparse_kernel_imports(monkeypatch):
     original_import = builtins.__import__
 
     def _guarded_import(name, *args, **kwargs):
-        if "attention_mla_sparse" in name or "sparse_mla" in name:
+        if any(part in _FORBIDDEN_CUDA_SPARSE_MODULES for part in name.split(".")):
             raise AssertionError(f"M1 dense contract must not import sparse kernel module: {name}")
         return original_import(name, *args, **kwargs)
 
@@ -223,4 +231,26 @@ def test_rtp_mla_attention_builds_m0_backend_from_mla_modules():
     output = attention(q, compressed_kv, k_pe, positions=torch.arange(2))
 
     assert output.shape == (2, 4, 16)
+
+
+def test_rtp_mla_attention_defaults_to_sparse_backend_from_mla_modules(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    from atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend import (
+        RTPSparseMlaBackend,
+    )
+
+    modules = SimpleNamespace(v_head_dim=16)
+    attention = RTPMLAAttention(mla_modules=modules, layer_num=3)
+
+    assert isinstance(attention.dense_backend, RTPSparseMlaBackend)
+
+
+def test_rtp_mla_attention_explicit_dense_backend_overrides_sparse_default(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    dense_backend = _FakeDenseBackend(v_head_dim=16)
+    modules = SimpleNamespace(v_head_dim=16)
+
+    attention = RTPMLAAttention(mla_modules=modules, dense_backend=dense_backend)
+
+    assert attention.dense_backend is dense_backend
 

@@ -1,9 +1,16 @@
 """Static guards for the GLM5 rtp-llm plugin path."""
 
+import ast
 from pathlib import Path
 
 
 _ATOM_ROOT = Path(__file__).resolve().parents[2]
+_FORBIDDEN_IMPORT_TIME_SPARSE_KERNELS = {
+    "flashmla_sparse",
+    "flash_mla",
+    "sparse_mla",
+    "attention_mla_sparse",
+}
 
 
 def _read_plugin_file(relative_path: str) -> str:
@@ -37,4 +44,23 @@ def test_glm5_mla_backend_is_not_full_attention_adapter():
     assert "class RTPMLAAttention" in source
     assert "use_mla" in source
     assert "RTPFullAttention" not in source
+
+
+def test_sparse_mla_backend_has_no_import_time_cuda_sparse_kernel_dependencies():
+    backend_path = _ATOM_ROOT / "atom/plugin/rtpllm/attention_backend/rtp_sparse_mla_backend.py"
+    assert backend_path.exists()
+
+    tree = ast.parse(backend_path.read_text())
+    imported_modules = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported_modules.add(node.module)
+
+    assert not any(
+        forbidden in module_name.split(".")
+        for module_name in imported_modules
+        for forbidden in _FORBIDDEN_IMPORT_TIME_SPARSE_KERNELS
+    )
 
