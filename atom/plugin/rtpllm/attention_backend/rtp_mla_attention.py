@@ -44,8 +44,6 @@ class RTPMLAAttention:
         topk_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if topk_indices is not None:
-            raise ValueError("M0 RTPMLAAttention does not consume sparse topk_indices")
         if self.dense_backend is None:
             raise NotImplementedError(
                 "RTPMLAAttention M0.5 requires a dense_backend for contract execution"
@@ -56,7 +54,7 @@ class RTPMLAAttention:
             k_pe,
             self.kv_cache,
             self.layer_id,
-            topk_indices=None,
+            topk_indices=topk_indices,
         )
 
     __call__ = forward

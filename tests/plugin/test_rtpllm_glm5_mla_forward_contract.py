@@ -1,7 +1,9 @@
 """Contract-executable tests for GLM5 RTP MLA dense forward."""
 
+import builtins
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
@@ -23,7 +25,7 @@ class _FakeDenseBackend:
                 "topk_indices": topk_indices,
             }
         )
-        return q.new_empty((q.shape[0], q.shape[1], self.v_head_dim))
+        return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
 
 
 def test_rtp_mla_attention_calls_dense_backend_with_rtp_boundary():
@@ -53,26 +55,68 @@ def test_rtp_mla_attention_calls_dense_backend_with_rtp_boundary():
     assert call["topk_indices"] is None
 
 
-def test_rtp_mla_attention_rejects_topk_in_m05():
+def _guard_sparse_kernel_imports(monkeypatch):
+    original_import = builtins.__import__
+
+    def _guarded_import(name, *args, **kwargs):
+        if "attention_mla_sparse" in name or "sparse_mla" in name:
+            raise AssertionError(f"M1 dense contract must not import sparse kernel module: {name}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _guarded_import)
+
+
+def test_rtp_mla_attention_accepts_m1_topk_and_passes_it_to_dense_backend(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
     attention = RTPMLAAttention(dense_backend=_FakeDenseBackend(v_head_dim=16))
     q = torch.empty(1, 2, 12)
     compressed_kv = torch.empty(1, 8)
     k_pe = torch.empty(1, 4)
     positions = torch.arange(1, dtype=torch.int32)
-    topk = torch.empty(1, 2048, dtype=torch.int32)
+    topk = torch.tensor([[3, 1, 0, 2]], dtype=torch.int32)
 
-    try:
-        attention.forward(
-            q,
-            compressed_kv,
-            k_pe,
-            positions=positions,
-            topk_indices=topk,
-        )
-    except ValueError as exc:
-        assert "topk" in str(exc)
-    else:
-        raise AssertionError("M0.5 dense forward must reject topk_indices")
+    output = attention.forward(
+        q,
+        compressed_kv,
+        k_pe,
+        positions=positions,
+        topk_indices=topk,
+    )
+
+    assert output.shape == (1, 2, 16)
+    assert len(attention.dense_backend.calls) == 1
+    assert attention.dense_backend.calls[0]["topk_indices"] is topk
+
+
+def test_dense_backend_output_does_not_depend_on_topk_values(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    backend = _FakeDenseBackend(v_head_dim=16)
+    attention = RTPMLAAttention(dense_backend=backend)
+    q = torch.ones(2, 2, 12)
+    compressed_kv = torch.empty(2, 8)
+    k_pe = torch.empty(2, 4)
+    positions = torch.arange(2, dtype=torch.int32)
+    topk_a = torch.tensor([[3, 1, 0, 2], [2, 0, 1, 3]], dtype=torch.int32)
+    topk_b = torch.tensor([[0, 2, 1, 3], [3, 1, 2, 0]], dtype=torch.int32)
+
+    out_a = attention.forward(
+        q,
+        compressed_kv,
+        k_pe,
+        positions=positions,
+        topk_indices=topk_a,
+    )
+    out_b = attention.forward(
+        q,
+        compressed_kv,
+        k_pe,
+        positions=positions,
+        topk_indices=topk_b,
+    )
+
+    assert torch.equal(out_a, out_b)
+    assert backend.calls[0]["topk_indices"] is topk_a
+    assert backend.calls[1]["topk_indices"] is topk_b
 
 
 def test_forward_rtp_plugin_mode_flattens_dense_output_before_o_proj():
