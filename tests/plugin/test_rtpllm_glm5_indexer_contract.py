@@ -1,184 +1,163 @@
-"""Contract-executable tests for GLM5 RTP MLA M1 indexer behavior."""
+"""Contract-executable tests for GLM5 RTP MLA M1.5 indexer behavior."""
 
+import builtins
 from types import SimpleNamespace
 
-import pytest
 import torch
 
-from atom.plugin.rtpllm.attention_backend import rtp_mla_prepare
-from atom.plugin.rtpllm.attention_backend.rtp_mla_prepare import (
-    RTPMlaPrepareResult,
-    build_m0_prepare_result,
-    build_m1_prepare_result,
-)
+from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
 
 
-def test_m0_prepare_result_rejects_topk_indices():
-    q = torch.empty(2, 4, 256)
-    compressed_kv = torch.empty(2, 512)
-    k_pe = torch.empty(2, 64)
-    positions = torch.arange(2, dtype=torch.int32)
-    topk = torch.empty(2, 4, dtype=torch.int32)
+def _guard_sparse_kernel_imports(monkeypatch):
+    original_import = builtins.__import__
 
-    try:
-        build_m0_prepare_result(
-            q=q,
-            compressed_kv=compressed_kv,
-            k_pe=k_pe,
-            positions=positions,
-            topk_indices=topk,
+    def _guarded_import(name, *args, **kwargs):
+        if "attention_mla_sparse" in name or "sparse_mla" in name:
+            raise AssertionError(f"M1.5 tests must not import sparse MLA kernels: {name}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _guarded_import)
+
+
+class _FakeDenseBackend:
+    def __init__(self, v_head_dim: int):
+        self.v_head_dim = v_head_dim
+        self.calls = []
+
+    def forward(self, q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=None):
+        self.calls.append(
+            {
+                "q": q,
+                "compressed_kv": compressed_kv,
+                "k_pe": k_pe,
+                "kv_cache": kv_cache,
+                "layer_id": layer_id,
+                "topk_indices": topk_indices,
+            }
         )
-    except ValueError as exc:
-        assert "M0" in str(exc)
-    else:
-        raise AssertionError("M0 prepare should reject topk_indices")
-
-
-def test_m1_prepare_result_accepts_int32_topk_indices_with_dynamic_k():
-    q = torch.empty(2, 4, 256)
-    compressed_kv = torch.empty(2, 512)
-    k_pe = torch.empty(2, 64)
-    positions = torch.arange(2, dtype=torch.int32)
-    topk = torch.tensor([[3, 1, 0, 2], [2, 0, 1, 3]], dtype=torch.int32)
-
-    result = build_m1_prepare_result(
-        q=q,
-        compressed_kv=compressed_kv,
-        k_pe=k_pe,
-        positions=positions,
-        topk_indices=topk,
-    )
-
-    assert isinstance(result, RTPMlaPrepareResult)
-    assert result.topk_indices is topk
-    assert result.topk_indices.shape == (2, 4)
-    assert result.topk_indices.dtype == torch.int32
-
-
-@pytest.mark.parametrize(
-    "topk_indices",
-    [
-        torch.empty(2, 4, dtype=torch.int64),
-        torch.empty(2, 4, 1, dtype=torch.int32),
-        torch.empty(3, 4, dtype=torch.int32),
-    ],
-)
-def test_m1_prepare_result_rejects_invalid_topk_shape_or_dtype(topk_indices):
-    q = torch.empty(2, 4, 256)
-    compressed_kv = torch.empty(2, 512)
-    k_pe = torch.empty(2, 64)
-    positions = torch.arange(2, dtype=torch.int32)
-
-    with pytest.raises(ValueError):
-        build_m1_prepare_result(
-            q=q,
-            compressed_kv=compressed_kv,
-            k_pe=k_pe,
-            positions=positions,
-            topk_indices=topk_indices,
-        )
+        return q.new_empty((q.shape[0], q.shape[1], self.v_head_dim))
 
 
 class _FakeIndexer:
-    def __init__(self, attn, values):
-        self.attn = attn
-        self.values = values
+    def __init__(self, topk_values):
         self.calls = []
-        self.weights = torch.full(values.shape, 99.0, dtype=torch.float32)
-
-    def __call__(self, *args, **kwargs):
-        self.calls.append((args, kwargs))
-        self.attn.indexer_called = True
-        self.attn._topk_indices_buffer[: self.values.shape[0], : self.values.shape[1]].copy_(
-            self.values
-        )
-        return self.weights
-
-
-class _FakeLinear:
-    def __init__(self, output):
-        self.output = output
-
-    def __call__(self, *_args, **_kwargs):
-        return self.output
-
-
-class _FakeNorm:
-    def __call__(self, tensor):
-        return tensor
-
-
-class _FakeM1Attention:
-    def __init__(self, hidden_states, topk_values):
-        self.indexer_called = False
-        self.q_lora_rank = 2
-        self.kv_lora_rank = 3
-        self.qk_rope_head_dim = 1
-        self.num_heads = 2
-        self.qk_head_dim = 4
-        self.layer_num = 7
         self.index_topk = topk_values.shape[1]
-        self._topk_indices_buffer = torch.full(
+        self.topk_indices_buffer = torch.full(
             (topk_values.shape[0], topk_values.shape[1] + 2),
             -1,
             dtype=torch.int32,
         )
-        self.fused_qkv_a_proj = _FakeLinear(
-            torch.arange(
-                hidden_states.shape[0]
-                * (self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim),
-                dtype=hidden_states.dtype,
-            ).reshape(hidden_states.shape[0], -1)
-        )
-        self.q_a_layernorm = _FakeNorm()
-        self.q_b_proj = _FakeLinear(
-            torch.arange(
-                hidden_states.shape[0] * self.num_heads * self.qk_head_dim,
-                dtype=hidden_states.dtype,
-            ).reshape(hidden_states.shape[0], -1)
-        )
-        self.kv_a_layernorm = _FakeNorm()
-        self.indexer = _FakeIndexer(self, topk_values)
-        self.mla_attn = SimpleNamespace()
-        self.o_proj = _FakeLinear(None)
+        self.topk_indices_buffer[
+            : topk_values.shape[0], : topk_values.shape[1]
+        ].copy_(topk_values)
+        self.weights = torch.full(topk_values.shape, 99.0, dtype=torch.float32)
 
-    @property
-    def topk_indices_buffer(self):
-        if not self.indexer_called:
-            raise AssertionError("prepare must call indexer before slicing topk_indices_buffer")
-        return self._topk_indices_buffer
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.weights
 
 
-def test_m1_default_prepare_calls_indexer_before_slicing_buffer_and_uses_buffer_topk():
-    hidden_states = torch.empty(2, 8)
-    positions = torch.arange(2, dtype=torch.int32)
-    topk_values = torch.tensor([[4, 1, 3, 0], [2, 0, 1, 3]], dtype=torch.int32)
-    attn = _FakeM1Attention(hidden_states, topk_values)
+class _FakeQProj:
+    def __init__(self, output):
+        self.output = output
+        self.calls = []
 
-    result = rtp_mla_prepare._default_prepare_result(attn, positions, hidden_states)
-
-    assert result.topk_indices is not None
-    assert len(attn.indexer.calls) == 1
-    assert result.topk_indices.shape == (2, 4)
-    assert result.topk_indices.dtype == torch.int32
-    assert torch.equal(result.topk_indices, topk_values)
-    assert result.topk_indices is not attn.indexer.weights
-    assert not torch.equal(result.topk_indices.to(torch.float32), attn.indexer.weights)
+    def __call__(self, query, q_scale=None):
+        self.calls.append((query, q_scale))
+        return self.output
 
 
-def test_m1_get_topk_indices_buffer_reads_real_indexer_owner_path():
+class _FakeOProj:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, tensor):
+        self.calls.append(tensor)
+        return tensor
+
+
+def _make_attention(topk_values):
+    token_count = topk_values.shape[0]
+    num_heads = 2
+    qk_head_dim = 4
+    v_head_dim = 3
+    projected_q = torch.arange(
+        token_count * num_heads * qk_head_dim, dtype=torch.float32
+    ).reshape(token_count, num_heads * qk_head_dim)
+    backend = _FakeDenseBackend(v_head_dim=v_head_dim)
+    indexer = _FakeIndexer(topk_values)
+    modules = SimpleNamespace(
+        q_proj=_FakeQProj(projected_q),
+        o_proj=_FakeOProj(),
+        kv_b_proj=object(),
+        indexer=indexer,
+        v_head_dim=v_head_dim,
+        qk_head_dim=qk_head_dim,
+        num_heads=num_heads,
+        num_local_heads=num_heads,
+        index_topk=topk_values.shape[1],
+    )
+    attention = RTPMLAAttention(
+        mla_modules=modules,
+        dense_backend=backend,
+        layer_num=7,
+        kv_cache="kv-cache",
+    )
+    return attention, modules, backend
+
+
+def test_constructor_injects_indexer_and_topk_indices_buffer_owner_path():
     topk_buffer = torch.tensor([[4, 1, 3, 0]], dtype=torch.int32)
-    attn = SimpleNamespace(indexer=SimpleNamespace(topk_indices_buffer=topk_buffer))
+    indexer = SimpleNamespace(topk_indices_buffer=topk_buffer, index_topk=4)
+    modules = SimpleNamespace(
+        q_proj=object(),
+        o_proj=object(),
+        kv_b_proj=object(),
+        indexer=indexer,
+        v_head_dim=3,
+    )
+    attention = RTPMLAAttention(mla_modules=modules)
 
-    assert rtp_mla_prepare._get_topk_indices_buffer(attn) is topk_buffer
+    assert attention.indexer is indexer
+    assert attention.topk_indices_buffer is topk_buffer
 
 
-def test_m1_should_emit_topk_returns_false_under_dummy_run(monkeypatch):
+def _run_attention(attention, token_count: int):
+    query = torch.empty(token_count, 6)
+    compressed_kv = torch.empty(token_count, 8)
+    k_rope = torch.empty(token_count, 3)
+    positions = torch.arange(token_count, dtype=torch.int32)
+    return attention.forward(
+        query,
+        compressed_kv,
+        k_rope,
+        positions=positions,
+    )
+
+
+def test_indexer_buffer_topk_is_passed_to_dense_backend_when_emit_allowed(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    topk_values = torch.tensor([[4, 1, 3, 0], [2, 0, 1, 3]], dtype=torch.int32)
+    attention, modules, backend = _make_attention(topk_values)
+
+    _run_attention(attention, token_count=topk_values.shape[0])
+
+    assert modules.indexer.calls == []
+    topk_indices = backend.calls[0]["topk_indices"]
+    assert topk_indices is not None
+    assert topk_indices.dtype == torch.int32
+    assert topk_indices.shape == topk_values.shape
+    assert torch.equal(topk_indices, topk_values)
+    assert topk_indices is not modules.indexer.weights
+    assert not torch.equal(topk_indices.to(torch.float32), modules.indexer.weights)
+
+
+def _patch_forward_context(monkeypatch, *, is_dummy_run, is_prefill, max_seqlen_k):
     from atom.utils import forward_context as forward_context_mod
 
     fake_forward_context = SimpleNamespace(
-        context=SimpleNamespace(is_dummy_run=True, is_prefill=False),
-        attn_metadata=SimpleNamespace(max_seqlen_k=4096),
+        context=SimpleNamespace(is_dummy_run=is_dummy_run, is_prefill=is_prefill),
+        attn_metadata=SimpleNamespace(max_seqlen_k=max_seqlen_k),
     )
     monkeypatch.setattr(
         forward_context_mod,
@@ -186,27 +165,37 @@ def test_m1_should_emit_topk_returns_false_under_dummy_run(monkeypatch):
         lambda: fake_forward_context,
     )
 
-    attn = SimpleNamespace(index_topk=4)
 
-    assert rtp_mla_prepare._should_emit_topk_indices(attn) is False
-
-
-def test_m1_should_emit_topk_returns_false_when_prefill_seqlen_within_index_topk(
-    monkeypatch,
-):
-    from atom.utils import forward_context as forward_context_mod
-
-    fake_forward_context = SimpleNamespace(
-        context=SimpleNamespace(is_dummy_run=False, is_prefill=True),
-        attn_metadata=SimpleNamespace(max_seqlen_k=4),
+def test_dummy_run_does_not_emit_topk_to_dense_backend(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    _patch_forward_context(
+        monkeypatch,
+        is_dummy_run=True,
+        is_prefill=False,
+        max_seqlen_k=4096,
     )
-    monkeypatch.setattr(
-        forward_context_mod,
-        "get_forward_context",
-        lambda: fake_forward_context,
+    topk_values = torch.tensor([[4, 1, 3, 0], [2, 0, 1, 3]], dtype=torch.int32)
+    attention, modules, backend = _make_attention(topk_values)
+
+    _run_attention(attention, token_count=topk_values.shape[0])
+
+    assert modules.indexer.calls == []
+    assert backend.calls[0]["topk_indices"] is None
+
+
+def test_short_prefill_does_not_emit_topk_to_dense_backend(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    _patch_forward_context(
+        monkeypatch,
+        is_dummy_run=False,
+        is_prefill=True,
+        max_seqlen_k=4,
     )
+    topk_values = torch.tensor([[4, 1, 3, 0], [2, 0, 1, 3]], dtype=torch.int32)
+    attention, modules, backend = _make_attention(topk_values)
 
-    attn = SimpleNamespace(index_topk=4)
+    _run_attention(attention, token_count=topk_values.shape[0])
 
-    assert rtp_mla_prepare._should_emit_topk_indices(attn) is False
+    assert modules.indexer.calls == []
+    assert backend.calls[0]["topk_indices"] is None
 

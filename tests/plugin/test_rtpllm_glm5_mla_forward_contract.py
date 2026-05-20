@@ -1,6 +1,7 @@
-"""Contract-executable tests for GLM5 RTP MLA dense forward."""
+"""Contract-executable tests for GLM5 RTP MLA native forward."""
 
 import builtins
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -28,7 +29,7 @@ class _FakeDenseBackend:
         return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
 
 
-def test_rtp_mla_attention_calls_dense_backend_with_rtp_boundary():
+def test_rtp_mla_attention_keeps_legacy_dense_boundary_during_migration():
     backend = _FakeDenseBackend(v_head_dim=16)
     attention = RTPMLAAttention(dense_backend=backend, layer_id=7, kv_cache="cache")
     q = torch.empty(3, 2, 12, dtype=torch.bfloat16)
@@ -66,7 +67,7 @@ def _guard_sparse_kernel_imports(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", _guarded_import)
 
 
-def test_rtp_mla_attention_accepts_m1_topk_and_passes_it_to_dense_backend(monkeypatch):
+def test_rtp_mla_attention_accepts_explicit_topk_and_passes_it_to_dense_backend(monkeypatch):
     _guard_sparse_kernel_imports(monkeypatch)
     attention = RTPMLAAttention(dense_backend=_FakeDenseBackend(v_head_dim=16))
     q = torch.empty(1, 2, 12)
@@ -119,48 +120,97 @@ def test_dense_backend_output_does_not_depend_on_topk_values(monkeypatch):
     assert backend.calls[1]["topk_indices"] is topk_b
 
 
-def test_forward_rtp_plugin_mode_flattens_dense_output_before_o_proj():
-    from atom.plugin.rtpllm.attention_backend.rtp_mla_prepare import (
-        RTPMlaPrepareResult,
-        forward_rtp_plugin_mode,
+def test_native_forward_signature_exposes_q_scale_argument():
+    signature = inspect.signature(RTPMLAAttention.forward)
+
+    assert "q_scale" in signature.parameters
+
+
+@pytest.mark.parametrize("attr", ["q_proj", "o_proj", "kv_b_proj", "v_head_dim"])
+def test_constructor_injects_native_mla_module_attributes(attr):
+    modules = SimpleNamespace(
+        q_proj=object(),
+        o_proj=object(),
+        kv_b_proj=object(),
+        v_head_dim=16,
+    )
+    attention = RTPMLAAttention(mla_modules=modules)
+
+    assert getattr(attention, attr) == getattr(modules, attr)
+
+
+class _FakeQProj:
+    def __init__(self, output):
+        self.output = output
+        self.calls = []
+
+    def __call__(self, query, q_scale=None):
+        self.calls.append((query, q_scale))
+        return self.output
+
+
+class _FakeOProj:
+    def __init__(self, hidden_dim: int):
+        self.hidden_dim = hidden_dim
+        self.calls = []
+
+    def __call__(self, tensor):
+        self.calls.append(tensor)
+        return tensor.new_empty((tensor.shape[0], self.hidden_dim))
+
+
+def test_native_five_tuple_projects_latent_query_and_applies_o_proj(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    token_count = 3
+    num_heads = 2
+    qk_head_dim = 4
+    v_head_dim = 5
+    hidden_dim = 7
+    query = torch.arange(token_count * 6, dtype=torch.float32).reshape(token_count, 6)
+    q_scale = torch.ones(token_count, 1)
+    projected_q = torch.arange(
+        token_count * num_heads * qk_head_dim, dtype=torch.float32
+    ).reshape(token_count, num_heads * qk_head_dim)
+    compressed_kv = torch.empty(token_count, 8)
+    k_rope = torch.empty(token_count, 3)
+    positions = torch.arange(token_count, dtype=torch.int32)
+    backend = _FakeDenseBackend(v_head_dim=v_head_dim)
+    modules = SimpleNamespace(
+        q_proj=_FakeQProj(projected_q),
+        o_proj=_FakeOProj(hidden_dim=hidden_dim),
+        kv_b_proj=object(),
+        v_head_dim=v_head_dim,
+        qk_head_dim=qk_head_dim,
+        num_heads=num_heads,
+        num_local_heads=num_heads,
+    )
+    attention = RTPMLAAttention(
+        mla_modules=modules,
+        dense_backend=backend,
+        layer_num=5,
+        kv_cache="kv-cache",
     )
 
-    q = torch.empty(3, 2, 12, dtype=torch.bfloat16)
-    compressed_kv = torch.empty(3, 8, dtype=torch.bfloat16)
-    k_pe = torch.empty(3, 4, dtype=torch.bfloat16)
-    positions = torch.arange(3, dtype=torch.int32)
-    backend = _FakeDenseBackend(v_head_dim=16)
-    seen = {}
-
-    class _FakeOProj:
-        def __call__(self, tensor):
-            seen["input_shape"] = tuple(tensor.shape)
-            return tensor
-
-    attn = SimpleNamespace(
-        mla_attn=RTPMLAAttention(dense_backend=backend, layer_id=5),
-        o_proj=_FakeOProj(),
+    output = attention.forward(
+        query,
+        compressed_kv,
+        k_rope,
+        positions=positions,
+        q_scale=q_scale,
     )
 
-    def _prepare(_attn, _positions, _hidden_states):
-        return RTPMlaPrepareResult(
-            q=q,
-            compressed_kv=compressed_kv,
-            k_pe=k_pe,
-            positions=positions,
-            topk_indices=None,
-        )
-
-    output = forward_rtp_plugin_mode(
-        attn,
-        positions,
-        torch.empty(3, 10),
-        prepare_fn=_prepare,
-    )
-
-    assert seen["input_shape"] == (3, 32)
-    assert output.shape == (3, 32)
+    assert modules.q_proj.calls == [(query, q_scale)]
     assert len(backend.calls) == 1
+    call = backend.calls[0]
+    assert call["q"].shape == (token_count, num_heads, qk_head_dim)
+    assert torch.equal(call["q"].reshape(token_count, -1), projected_q)
+    assert call["compressed_kv"] is compressed_kv
+    assert call["k_pe"] is k_rope
+    assert call["kv_cache"] == "kv-cache"
+    assert call["layer_id"] == 5
+    assert len(modules.o_proj.calls) == 1
+    assert modules.o_proj.calls[0].shape == (token_count, num_heads * v_head_dim)
+    assert output.shape == (token_count, hidden_dim)
 
 
 def test_rtp_mla_attention_builds_m0_backend_from_mla_modules():

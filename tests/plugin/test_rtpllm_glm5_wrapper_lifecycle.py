@@ -1,5 +1,6 @@
 """Lifecycle tests for the GLM5 rtp-llm wrapper."""
 
+from contextlib import nullcontext
 import importlib
 import os
 import sys
@@ -149,7 +150,13 @@ def test_glm5_load_skip_python_model_does_not_create_atom_model():
         assert isinstance(instance.weight_manager, module._NoopWeightManager)
 
 
-def test_glm5_create_python_model_calls_prepare_model_rtpllm_without_qwen_patches():
+def _patch_optional_attr(module, attr):
+    if hasattr(module, attr):
+        return patch.object(module, attr)
+    return nullcontext(MagicMock(name=attr))
+
+
+def test_glm5_create_python_model_lets_prepare_model_own_mla_patching():
     fake_modules = _install_fake_rtp_modules()
     fake_atom_model = MagicMock(name="atom_model")
     fake_atom_model.to.return_value = fake_atom_model
@@ -168,14 +175,16 @@ def test_glm5_create_python_model_calls_prepare_model_rtpllm_without_qwen_patche
         instance.device = "cpu"
         instance.weight = MagicMock()
 
-        with patch.object(module, "apply_attention_mla_rtpllm_patch") as mla_patch, patch.object(
+        with _patch_optional_attr(
+            module, "apply_attention_mla_rtpllm_patch"
+        ) as mla_patch, _patch_optional_attr(
             module, "apply_deepseek_mla_rtpllm_patch"
         ) as deepseek_patch:
             result = instance._create_python_model()
 
         prepare_model.assert_called_once_with(config=instance, engine="rtpllm")
-        mla_patch.assert_called_once()
-        deepseek_patch.assert_called_once()
+        mla_patch.assert_not_called()
+        deepseek_patch.assert_not_called()
         load_model_in_plugin_mode = fake_modules[
             "atom.model_loader.loader"
         ].load_model_in_plugin_mode

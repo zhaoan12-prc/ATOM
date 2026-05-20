@@ -5,7 +5,6 @@ from .rtp_mla_metadata import (
     GLM5_RTP_OWNERSHIP,
     RTPMlaPluginMetadata,
 )
-from .rtp_mla_prepare import RTPMlaPrepareResult, build_m0_prepare_result
 
 
 def __getattr__(name):
@@ -31,9 +30,7 @@ __all__ = [
     "GLM5_RTP_BRIDGE_MODE_M0_DENSE",
     "GLM5_RTP_OWNERSHIP",
     "RTPMlaPluginMetadata",
-    "RTPMlaPrepareResult",
     "apply_attention_gdn_rtpllm_patch",
     "apply_attention_mha_rtpllm_patch",
     "apply_attention_mla_rtpllm_patch",
-    "build_m0_prepare_result",
 ]
