@@ -12,16 +12,58 @@ class _M0DenseBackend:
         self.v_head_dim = int(v_head_dim)
 
     def forward(self, q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=None):
-        return q.new_empty((q.shape[0], q.shape[1], self.v_head_dim))
+        return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
+
+
+def _resolve_index_topk(attn) -> int:
+    for obj, attr in (
+        (getattr(attn, "indexer", None), "index_topk"),
+        (getattr(attn, "indexer", None), "topk_tokens"),
+        (attn, "index_topk"),
+        (getattr(attn, "config", None), "index_topk"),
+    ):
+        value = getattr(obj, attr, None) if obj is not None else None
+        if value is not None:
+            return int(value)
+    raise AttributeError("GLM5 RTP MLA M1 indexer requires index_topk/topk_tokens")
+
+
+def _get_topk_indices_buffer(attn) -> torch.Tensor:
+    indexer = getattr(attn, "indexer", None)
+    buffer = getattr(indexer, "topk_indices_buffer", None) if indexer is not None else None
+    if buffer is None:
+        buffer = getattr(attn, "topk_indices_buffer", None)
+    if buffer is None:
+        buffer = getattr(attn, "_topk_indices_buffer", None)
+    if buffer is None:
+        raise AttributeError("GLM5 RTP MLA M1 indexer requires topk_indices_buffer")
+    return buffer
+
+
+def _should_emit_topk_indices(attn) -> bool:
+    try:
+        from atom.utils.forward_context import get_forward_context
+
+        forward_context = get_forward_context()
+    except Exception:
+        return True
+
+    context = getattr(forward_context, "context", None)
+    if getattr(context, "is_dummy_run", False):
+        return False
+    attn_metadata = getattr(forward_context, "attn_metadata", None)
+    if getattr(context, "is_prefill", False) and attn_metadata is not None:
+        max_seqlen_k = getattr(attn_metadata, "max_seqlen_k", None)
+        if max_seqlen_k is not None:
+            try:
+                return int(max_seqlen_k) > _resolve_index_topk(attn)
+            except AttributeError:
+                return True
+    return True
 
 
 class RTPMLAAttention:
-    """M0 skeleton for an RTP MLA adapter.
-
-    This class intentionally does not inherit or wrap the full-attention adapter.
-    M0 establishes the constructor/forward contract only; dense MLA execution is
-    filled in before M1 indexer work starts.
-    """
+    """Dense RTP MLA adapter for the native GLM5 MLA call contract."""
 
     use_mla = True
 
@@ -29,18 +71,74 @@ class RTPMLAAttention:
         self.args = args
         self.kwargs = kwargs
         mla_modules = kwargs.get("mla_modules")
+        self.mla_modules = mla_modules
+        self.q_proj = getattr(mla_modules, "q_proj", None)
+        self.o_proj = getattr(mla_modules, "o_proj", None)
+        self.kv_b_proj = getattr(mla_modules, "kv_b_proj", None)
+        self.indexer = getattr(mla_modules, "indexer", None)
+        self.qk_head_dim = getattr(mla_modules, "qk_head_dim", None)
+        self.v_head_dim = getattr(mla_modules, "v_head_dim", None)
+        self.q_lora_rank = getattr(mla_modules, "q_lora_rank", None)
+        self.kv_lora_rank = getattr(mla_modules, "kv_lora_rank", None)
+        self.num_heads = getattr(mla_modules, "num_heads", None)
+        self.num_local_heads = getattr(mla_modules, "num_local_heads", self.num_heads)
+        self.index_topk = getattr(mla_modules, "index_topk", None)
+        self.topk_indices_buffer = (
+            getattr(self.indexer, "topk_indices_buffer", None)
+            if self.indexer is not None
+            else None
+        )
         self.dense_backend = kwargs.get("dense_backend")
         if self.dense_backend is None and mla_modules is not None:
             self.dense_backend = _M0DenseBackend(mla_modules.v_head_dim)
         self.kv_cache = kwargs.get("kv_cache")
         self.layer_id = int(kwargs.get("layer_id", kwargs.get("layer_num", 0)))
 
+    def _project_query(
+        self, query: torch.Tensor, q_scale: Optional[torch.Tensor]
+    ) -> tuple[torch.Tensor, bool]:
+        if query.ndim == 3:
+            return query, False
+        if self.q_proj is None:
+            return query, False
+
+        q = self.q_proj(query, q_scale)
+        if q.ndim == 3:
+            return q, True
+
+        num_heads = self.num_local_heads if self.num_local_heads is not None else self.num_heads
+        if num_heads is None:
+            if self.qk_head_dim is None:
+                raise AttributeError("GLM5 RTP MLA native contract requires num_heads")
+            num_heads = q.shape[-1] // int(self.qk_head_dim)
+        if self.qk_head_dim is None:
+            self.qk_head_dim = q.shape[-1] // int(num_heads)
+        return q.reshape(-1, int(num_heads), int(self.qk_head_dim)), True
+
+    def _resolve_topk_indices(
+        self,
+        query: torch.Tensor,
+        q_scale: Optional[torch.Tensor],
+        positions: Optional[torch.Tensor],
+        explicit_topk_indices: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if explicit_topk_indices is not None:
+            return explicit_topk_indices
+        if self.indexer is None:
+            return None
+
+        if not _should_emit_topk_indices(self):
+            return None
+        index_topk = _resolve_index_topk(self)
+        return _get_topk_indices_buffer(self)[: query.shape[0], :index_topk]
+
     def forward(
         self,
-        q: torch.Tensor,
+        query: torch.Tensor,
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
+        q_scale: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -48,7 +146,14 @@ class RTPMLAAttention:
             raise NotImplementedError(
                 "RTPMLAAttention M0.5 requires a dense_backend for contract execution"
             )
-        return self.dense_backend.forward(
+        q, native_projected = self._project_query(query, q_scale)
+        topk_indices = self._resolve_topk_indices(
+            query,
+            q_scale,
+            positions,
+            kwargs.get("topk_indices", topk_indices),
+        )
+        attn_output = self.dense_backend.forward(
             q,
             compressed_kv,
             k_pe,
@@ -56,6 +161,10 @@ class RTPMLAAttention:
             self.layer_id,
             topk_indices=topk_indices,
         )
+        if native_projected and self.o_proj is not None:
+            attn_output = attn_output.reshape(attn_output.shape[0], -1).contiguous()
+            return self.o_proj(attn_output)
+        return attn_output
 
     __call__ = forward
 

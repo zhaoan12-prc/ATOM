@@ -1,54 +1,23 @@
-"""Patch behavior tests for GLM5 RTP MLA forward."""
+"""No-monkey-patch guards for GLM5 RTP MLA M1.5 forward."""
 
-from types import SimpleNamespace
-
-from atom.plugin.rtpllm.attention_backend.rtp_mla_prepare import (
-    apply_deepseek_mla_rtpllm_patch,
-)
+from pathlib import Path
 
 
-class _FakeAttention:
-    def forward(self, positions, hidden_states):
-        return ("original", positions, hidden_states)
+_ATOM_ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_apply_deepseek_mla_patch_marks_forward_and_keeps_wrapped():
-    apply_deepseek_mla_rtpllm_patch(_FakeAttention)
-
-    assert getattr(_FakeAttention.forward, "_rtpllm_patched") is True
-    assert _FakeAttention.forward.__wrapped__ is not None
+def _read_plugin_file(relative_path: str) -> str:
+    return (_ATOM_ROOT / relative_path).read_text()
 
 
-def test_apply_deepseek_mla_patch_is_idempotent():
-    apply_deepseek_mla_rtpllm_patch(_FakeAttention)
-    first_forward = _FakeAttention.forward
-    first_wrapped = first_forward.__wrapped__
-
-    apply_deepseek_mla_rtpllm_patch(_FakeAttention)
-
-    assert _FakeAttention.forward is first_forward
-    assert _FakeAttention.forward.__wrapped__ is first_wrapped
+def test_rtp_mla_prepare_no_longer_contains_deepseek_forward_monkey_patch():
+    assert not (
+        _ATOM_ROOT / "atom/plugin/rtpllm/attention_backend/rtp_mla_prepare.py"
+    ).exists()
 
 
-def test_patched_forward_calls_plugin_mode():
-    from atom.plugin.rtpllm.attention_backend import rtp_mla_prepare
+def test_glm5_wrapper_does_not_import_or_call_deepseek_mla_patch():
+    source = _read_plugin_file("atom/plugin/rtpllm/models/glm5.py")
 
-    calls = []
-
-    def _fake_plugin_mode(attn, positions, hidden_states, **kwargs):
-        calls.append((attn, positions, hidden_states, kwargs))
-        return "patched"
-
-    original = rtp_mla_prepare.forward_rtp_plugin_mode
-    rtp_mla_prepare.forward_rtp_plugin_mode = _fake_plugin_mode
-    try:
-        apply_deepseek_mla_rtpllm_patch(_FakeAttention)
-        result = _FakeAttention().forward("pos", "hidden")
-    finally:
-        rtp_mla_prepare.forward_rtp_plugin_mode = original
-
-    assert result == "patched"
-    assert len(calls) == 1
-    assert isinstance(calls[0][0], _FakeAttention)
-    assert calls[0][1:] == ("pos", "hidden", {})
+    assert "apply_deepseek_mla_rtpllm_patch" not in source
 

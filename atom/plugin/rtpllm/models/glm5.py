@@ -13,13 +13,6 @@ from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.ops import ParallelismConfig
 from rtp_llm.ops.compute_ops import PyModelInputs
 
-from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import (
-    apply_attention_mla_rtpllm_patch,
-)
-from atom.plugin.rtpllm.attention_backend.rtp_mla_prepare import (
-    apply_deepseek_mla_rtpllm_patch,
-)
-
 logger = logging.getLogger("atom.plugin.rtpllm.models")
 
 
@@ -123,9 +116,6 @@ class ATOMGlm5Moe(DeepSeekV2):
 
         import atom
         from atom.model_loader.loader import load_model_in_plugin_mode
-
-        apply_attention_mla_rtpllm_patch()
-        apply_deepseek_mla_rtpllm_patch()
 
         atom_model = atom.prepare_model(config=self, engine="rtpllm")
         if atom_model is None:
