@@ -120,6 +120,10 @@ def prepare_model(config: Any, engine: str):
         }:
             register_ops_to_sglang(atom_config=atom_config)
     set_attn_cls()
+    if is_rtpllm() and model_arch == "GlmMoeDsaForCausalLM":
+        from atom.plugin.rtpllm.attention_backend import apply_attention_mla_rtpllm_patch
+
+        apply_attention_mla_rtpllm_patch()
 
     # init aiter dist for using aiter custom collective ops
     init_aiter_dist(config=atom_config)
