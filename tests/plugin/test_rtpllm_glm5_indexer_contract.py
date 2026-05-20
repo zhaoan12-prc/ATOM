@@ -8,11 +8,19 @@ import torch
 from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
 
 
+_FORBIDDEN_CUDA_SPARSE_MODULES = (
+    "flashmla_sparse",
+    "flash_mla",
+    "sparse_mla",
+    "attention_mla_sparse",
+)
+
+
 def _guard_sparse_kernel_imports(monkeypatch):
     original_import = builtins.__import__
 
     def _guarded_import(name, *args, **kwargs):
-        if "attention_mla_sparse" in name or "sparse_mla" in name:
+        if any(part in _FORBIDDEN_CUDA_SPARSE_MODULES for part in name.split(".")):
             raise AssertionError(f"M1.5 tests must not import sparse MLA kernels: {name}")
         return original_import(name, *args, **kwargs)
 
@@ -196,6 +204,25 @@ def test_short_prefill_does_not_emit_topk_to_dense_backend(monkeypatch):
 
     _run_attention(attention, token_count=topk_values.shape[0])
 
+    assert modules.indexer.calls == []
+    assert backend.calls[0]["topk_indices"] is None
+
+
+def test_prefill_within_topk_buffer_padding_does_not_emit_topk(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    _patch_forward_context(
+        monkeypatch,
+        is_dummy_run=False,
+        is_prefill=True,
+        max_seqlen_k=5,
+    )
+    topk_values = torch.tensor([[4, 1, 3, 0], [2, 0, 1, 3]], dtype=torch.int32)
+    attention, modules, backend = _make_attention(topk_values)
+
+    _run_attention(attention, token_count=topk_values.shape[0])
+
+    assert modules.indexer.index_topk == 4
+    assert modules.indexer.topk_indices_buffer.shape[1] == 6
     assert modules.indexer.calls == []
     assert backend.calls[0]["topk_indices"] is None
 

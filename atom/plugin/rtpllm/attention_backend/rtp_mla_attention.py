@@ -56,7 +56,7 @@ def _should_emit_topk_indices(attn) -> bool:
         max_seqlen_k = getattr(attn_metadata, "max_seqlen_k", None)
         if max_seqlen_k is not None:
             try:
-                return int(max_seqlen_k) > _resolve_index_topk(attn)
+                return int(max_seqlen_k) > _get_topk_indices_buffer(attn).shape[1]
             except AttributeError:
                 return True
     return True
@@ -88,9 +88,20 @@ class RTPMLAAttention:
             if self.indexer is not None
             else None
         )
-        self.dense_backend = kwargs.get("dense_backend")
-        if self.dense_backend is None and mla_modules is not None:
-            self.dense_backend = _M0DenseBackend(mla_modules.v_head_dim)
+        injected_backend = kwargs.get("dense_backend")
+        if injected_backend is not None:
+            self.dense_backend = injected_backend
+        elif mla_modules is not None:
+            from atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend import (
+                RTPSparseMlaBackend,
+            )
+
+            self.dense_backend = RTPSparseMlaBackend(
+                dense_backend=_M0DenseBackend(mla_modules.v_head_dim),
+                v_head_dim=mla_modules.v_head_dim,
+            )
+        else:
+            self.dense_backend = None
         self.kv_cache = kwargs.get("kv_cache")
         self.layer_id = int(kwargs.get("layer_id", kwargs.get("layer_num", 0)))
 
@@ -144,7 +155,7 @@ class RTPMLAAttention:
     ) -> torch.Tensor:
         if self.dense_backend is None:
             raise NotImplementedError(
-                "RTPMLAAttention M0.5 requires a dense_backend for contract execution"
+                "RTPMLAAttention requires an attention backend for contract execution"
             )
         q, native_projected = self._project_query(query, q_scale)
         topk_indices = self._resolve_topk_indices(
