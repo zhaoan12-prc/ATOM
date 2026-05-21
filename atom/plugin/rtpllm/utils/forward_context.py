@@ -436,6 +436,13 @@ class RTPForwardContext:
 
     @staticmethod
     def _build_seq_lens(attn_inputs: Any, *, device: torch.device) -> torch.Tensor:
+        """Build kernel seq_lens using RTP-native field priority.
+
+        Decode should prefer sequence_lengths when present because it carries the
+        committed context length before adding the current input token count.
+        sequence_lengths_plus_1_d is kept as the older fallback used by RTP graph
+        dummy inputs.
+        """
         input_lengths = RTPForwardContext._non_empty_int32(
             getattr(attn_inputs, "input_lengths", None),
             device=device,

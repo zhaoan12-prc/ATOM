@@ -80,9 +80,8 @@ class _ATOMAttnPyObj:
         return None
 
     def prepare_cuda_graph(self, attn_inputs) -> None:
-        # Forward to each layer. Layer-side prepare_cuda_graph is a no-op today
-        # (rtp+atom_graph.md §4.1); kept here so future per-layer state refresh
-        # has a wire-up point.
+        # Replay enters here without re-running prepare_fmha_impl, so forward
+        # the latest block mapping to each layer's fused-KV params cache.
         for layer in self._rtp_full_attn_layers:
             layer.prepare_cuda_graph(attn_inputs)
 
