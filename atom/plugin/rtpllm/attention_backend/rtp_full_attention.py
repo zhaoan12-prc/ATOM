@@ -505,12 +505,9 @@ class RTPFullAttention(BaseAttention):
                 device=device,
             ),
             "unit_scale": torch.ones(1, dtype=torch.float32, device=device),
-            # Round 24 / Step 1 — prewarm aligned k/v buffers so capture path
-            # can do in-place writes instead of repeat_interleave (which allocs
-            # a fresh tensor each layer; ptrs get reclaimed/reused by PyTorch
-            # caching allocator and are invalid at replay time → page fault).
-            # Sized for max capture batch (decode-only: max_num_tokens covers
-            # max(decode_capture_batch_sizes)).
+            # Prewarm aligned k/v buffers so capture can write in-place instead
+            # of recording fresh repeat_interleave allocations whose addresses
+            # may be reused by PyTorch's caching allocator after capture.
             "k_aligned": torch.empty(
                 (int(max_num_tokens), int(eff_kv_heads), int(self.head_dim)),
                 dtype=query_dtype,
@@ -521,13 +518,8 @@ class RTPFullAttention(BaseAttention):
                 dtype=query_dtype,
                 device=device,
             ),
-            # Round 25 / Step 2 — same problem for q: ATOM's QKV linear writes
-            # q to a fresh PyTorch caching-pool address every forward, which is
-            # reused across layers (Round 24 audit showed q.data_ptr shared by
-            # 5 layers). Capture records this transient ptr; after capture
-            # PyTorch may hand the slot to RTP setup/replay-init alloc → replay
-            # paged_attention reads stale/unmapped memory → GPU page fault.
-            # Stabilize by copying q into a per-layer prewarm buffer.
+            # Stabilize q as well: ATOM's QKV linear can hand capture a transient
+            # caching-pool address that later gets reused before graph replay.
             "q_aligned": torch.empty(
                 (int(max_num_tokens), int(self.num_heads), int(self.head_dim)),
                 dtype=query_dtype,
@@ -591,14 +583,8 @@ class RTPFullAttention(BaseAttention):
         q = query.view(-1, self.num_heads, self.head_dim)
         k = key.view(-1, self.num_kv_heads, self.head_dim)
         v = value.view(-1, self.num_kv_heads, self.head_dim)
-        # Round 25 / Step 2 — capture-mode q stabilization. ATOM's QKV linear
-        # writes q to a fresh PyTorch caching-pool address each forward; that
-        # address is reused across layers (Round 24 audit showed q.data_ptr
-        # shared by 5 layers). Captured paged_attention reads from that ptr;
-        # after capture PyTorch may hand it to RTP's setup/replay alloc, and
-        # replay reads stale memory → GPU page fault. Mirror Step 1: in-place
-        # copy q into a per-layer prewarm buffer so the captured kernel reads
-        # from a stable address.
+        # In capture mode, copy q into a per-layer prewarm buffer so the captured
+        # kernel reads from a stable address instead of a transient allocator slot.
         if (
             torch.cuda.is_current_stream_capturing()
             and self._cg_static_bufs is not None
@@ -641,11 +627,8 @@ class RTPFullAttention(BaseAttention):
                 f"current={target_kv_heads}; cuda-graph cannot capture this layer."
             )
         if target_kv_heads != self.num_kv_heads:
-            # Round 24 / Step 1: capture-mode path uses the prewarmed
-            # `k_aligned` / `v_aligned` static buffers and writes into them
-            # IN-PLACE, so the captured kernels reference the (stable) prewarm
-            # addresses instead of fresh repeat_interleave allocs that get
-            # reclaimed by PyTorch caching allocator after capture.
+            # Capture writes into prewarmed k/v buffers so kernels reference
+            # stable addresses instead of fresh repeat_interleave allocations.
             in_capture_align = (
                 torch.cuda.is_current_stream_capturing()
                 and self._cg_static_bufs is not None

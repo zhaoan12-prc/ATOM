@@ -125,14 +125,8 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         # cuda-graph attn_pyobj cache (see _ATOMAttnPyObj).
         self._atom_attn_pyobj: _ATOMAttnPyObj | None = None
         self._cg_layers_prewarmed: bool = False
-        # Capture budget; prewarm uses these. We want max_num_tokens to be the
-        # largest batch size that will actually be captured, NOT the runtime
-        # concurrency limit. RTP only captures graphs for batch sizes listed in
-        # decode_capture_batch_sizes (env DECODE_CAPTURE_CONFIG). Sizing prewarm
-        # for max_generate_batch_size when that's much larger (e.g. 128 vs 8)
-        # over-allocates tmp_output ≈ [N, num_heads, max_partitions, head_dim]
-        # by 16× — enough on TP=4 fp8 to push PyTorch caching allocator past
-        # the point where it can extend a 256 MiB segment during capture.
+        # Prewarm only for buckets RTP will capture; using the full concurrency
+        # limit can over-allocate graph static buffers enough to break capture.
         decode_caps = getattr(py_hw_kernel_config, "decode_capture_batch_sizes", None)
         if decode_caps:
             self._cg_max_num_tokens: int = min(
@@ -309,17 +303,7 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
     def prepare_fmha_impl(
         self, inputs: PyModelInputs, is_cuda_graph: bool = False
     ) -> Any:
-        """Override base class to return ATOM-aware container.
-
-        RTP CudaGraphRunner.cc:480 calls this once during initCapture and stores
-        the returned object as ``attn_pyobj``; CudaGraphRunner.cc:122 then calls
-        ``attn_pyobj.prepare_cuda_graph(attn_inputs)`` before each replay.
-
-        Returning the base RTP fmha_impl (which has its own prepare_cuda_graph)
-        is wrong here because ATOM's RTPFullAttention reads from forward_context
-        independently and never consults the RTP fmha_impl object — see
-        rtp+atom_graph.md §4.1 (首要根因).
-        """
+        """Return ATOM-aware attention container for RTP CUDA graph hooks."""
         if self._atom_attn_pyobj is None:
             self._atom_attn_pyobj = _ATOMAttnPyObj(self)
         self._atom_attn_pyobj.is_cuda_graph = bool(is_cuda_graph)
