@@ -159,6 +159,25 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             return int(inputs.input_hiddens.shape[0])
         return 0
 
+    @staticmethod
+    def _build_token_positions(
+        input_lengths: torch.Tensor,
+        starts: torch.Tensor,
+    ) -> torch.Tensor | None:
+        token_starts = torch.repeat_interleave(starts, input_lengths)
+        if token_starts.numel() == 0:
+            return None
+        per_seq_base = input_lengths.cumsum(dim=0) - input_lengths
+        token_ordinal = (
+            torch.cumsum(
+                torch.repeat_interleave(torch.ones_like(input_lengths), input_lengths),
+                dim=0,
+            )
+            - 1
+        )
+        token_ordinal = token_ordinal - torch.repeat_interleave(per_seq_base, input_lengths)
+        return (token_starts + token_ordinal).to(dtype=torch.int32).contiguous()
+
     def _build_positions_from_attention_inputs(
         self, attn_inputs: Any, model_device: torch.device
     ) -> torch.Tensor | None:
@@ -183,23 +202,7 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             if int(prefix_lengths_i32.numel()) < int(input_lengths_i32.numel()):
                 return None
             starts = prefix_lengths_i32[: int(input_lengths_i32.numel())]
-            token_starts = torch.repeat_interleave(starts, input_lengths_i32)
-            if token_starts.numel() == 0:
-                return None
-            per_seq_base = input_lengths_i32.cumsum(dim=0) - input_lengths_i32
-            token_ordinal = (
-                torch.cumsum(
-                    torch.repeat_interleave(
-                        torch.ones_like(input_lengths_i32), input_lengths_i32
-                    ),
-                    dim=0,
-                )
-                - 1
-            )
-            token_ordinal = token_ordinal - torch.repeat_interleave(
-                per_seq_base, input_lengths_i32
-            )
-            return (token_starts + token_ordinal).to(dtype=torch.int32).contiguous()
+            return self._build_token_positions(input_lengths_i32, starts)
 
         sequence_lengths = getattr(attn_inputs, "sequence_lengths", None)
         if sequence_lengths is None or sequence_lengths.numel() == 0:
@@ -212,23 +215,7 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         starts = (
             sequence_lengths_i32[: int(input_lengths_i32.numel())] - input_lengths_i32 + 1
         )
-        token_starts = torch.repeat_interleave(starts, input_lengths_i32)
-        if token_starts.numel() == 0:
-            return None
-        per_seq_base = input_lengths_i32.cumsum(dim=0) - input_lengths_i32
-        token_ordinal = (
-            torch.cumsum(
-                torch.repeat_interleave(
-                    torch.ones_like(input_lengths_i32), input_lengths_i32
-                ),
-                dim=0,
-            )
-            - 1
-        )
-        token_ordinal = token_ordinal - torch.repeat_interleave(
-            per_seq_base, input_lengths_i32
-        )
-        return (token_starts + token_ordinal).to(dtype=torch.int32).contiguous()
+        return self._build_token_positions(input_lengths_i32, starts)
 
     def _extract_combo_positions(
         self, inputs: PyModelInputs, model_device: torch.device
