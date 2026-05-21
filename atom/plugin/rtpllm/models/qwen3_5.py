@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from contextlib import contextmanager
@@ -5,10 +6,10 @@ from typing import Any
 
 import torch
 from rtp_llm.config.model_config import ModelConfig
-from rtp_llm.model_loader.model_weight_info import ModelWeights
-from rtp_llm.models.qwen3_next.qwen3_next import Qwen35Moe
+from rtp_llm.model_loader.model_weight_info import ModelDeployWeightInfo, ModelWeights
+from rtp_llm.models.base_model import BaseModel
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
-from rtp_llm.ops import ParallelismConfig
+from rtp_llm.ops import HybridAttentionType, ParallelismConfig
 from rtp_llm.ops.compute_ops import PyModelInputs, PyModelOutputs
 from rtp_llm.utils.model_weight import W
 
@@ -45,6 +46,11 @@ class _NoopModelWeightsLoader:
             device,
         )
         return None
+
+
+class _StubWeightInfo(ModelDeployWeightInfo):
+    def _get_weight_info(self):
+        return []
 
 
 class _ATOMAttnPyObj:
@@ -439,13 +445,91 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         return PyModelOutputs(hidden_states)
 
 
-class ATOMQwen35Moe(Qwen35Moe):
+class ATOMQwen35Moe(BaseModel):
     """Qwen3.5-MoE model class that starts ATOM runtime in rtp-llm."""
 
     @staticmethod
     def _is_external_plugin_mode() -> bool:
         modules = os.getenv("RTP_LLM_EXTERNAL_MODEL_PACKAGES", "")
         return "atom.plugin.rtpllm.models" in modules
+
+    @staticmethod
+    def get_weight_cls():
+        return _StubWeightInfo
+
+    @classmethod
+    def _create_config(cls, ckpt_path: str) -> ModelConfig:
+        config_path = os.path.join(ckpt_path, "config.json")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"config.json not found in {ckpt_path}")
+
+        with open(config_path) as reader:
+            config_json = json.loads(reader.read())
+        config_json = config_json["text_config"]
+
+        config = ModelConfig()
+        config.ckpt_path = ckpt_path
+        config.attn_config.head_num = config_json["num_attention_heads"]
+        config.attn_config.kv_head_num = config_json["num_key_value_heads"]
+        config.attn_config.size_per_head = config_json["head_dim"]
+        config.num_layers = config_json["num_hidden_layers"]
+        config.hidden_size = config_json["hidden_size"]
+        config.vocab_size = config_json["vocab_size"]
+        config.max_seq_len = config_json["max_position_embeddings"]
+        config.tie_word_embeddings = config_json.get("tie_word_embeddings", False)
+
+        rope_parameters = config_json["rope_parameters"]
+        config.attn_config.rope_config.style = 1
+        config.attn_config.rope_config.base = rope_parameters["rope_theta"]
+        config.partial_rotary_factor = rope_parameters["partial_rotary_factor"]
+        config.attn_config.rope_config.dim = int(
+            config.attn_config.size_per_head * config.partial_rotary_factor
+        )
+
+        config.layernorm_eps = config_json["rms_norm_eps"]
+        config.norm_type = "rmsnorm"
+        config.has_pre_decoder_layernorm = False
+        config.has_post_decoder_layernorm = True
+        config.qk_norm = True
+        config.activation_type = "SiGLU"
+
+        config.moe_k = config_json["num_experts_per_tok"]
+        config.expert_num = config_json["num_experts"]
+        config.moe_inter_size = config_json["moe_intermediate_size"]
+        config.inter_size = config_json["shared_expert_intermediate_size"]
+        config.has_moe_norm = config_json.get("norm_topk_prob", True)
+        config.moe_style = 2
+
+        moe_step = config_json.get("decoder_sparse_step", 1)
+        config.moe_layer_index = [
+            idx for idx in range(config.num_layers) if (idx + 1) % moe_step == 0
+        ]
+
+        attention_step = config_json["full_attention_interval"]
+        config.hybrid_attention_config.enable_hybrid_attention = True
+        config.hybrid_attention_config.hybrid_attention_types = [
+            HybridAttentionType.NONE
+            if (idx + 1) % attention_step == 0
+            else HybridAttentionType.LINEAR
+            for idx in range(config.num_layers)
+        ]
+
+        config.linear_attention_config.linear_conv_kernel_dim = config_json[
+            "linear_conv_kernel_dim"
+        ]
+        config.linear_attention_config.linear_key_head_dim = config_json[
+            "linear_key_head_dim"
+        ]
+        config.linear_attention_config.linear_num_key_heads = config_json[
+            "linear_num_key_heads"
+        ]
+        config.linear_attention_config.linear_num_value_heads = config_json[
+            "linear_num_value_heads"
+        ]
+        config.linear_attention_config.linear_value_head_dim = config_json[
+            "linear_value_head_dim"
+        ]
+        return config
 
     def support_cuda_graph(self) -> bool:
         """Tell RTP PyWrappedModel.h:160 whether to construct CudaGraphRunner.
@@ -518,13 +602,13 @@ class ATOMQwen35Moe(Qwen35Moe):
             )
             return
 
-        # Non-plugin mode keeps native behavior.
-        super().load(skip_python_model=skip_python_model)
+        raise RuntimeError("ATOMQwen35Moe is only supported as an RTP external plugin.")
 
     def _create_python_model(self):
-        # Non-external mode should keep native rtp-llm Python model path.
         if not self._is_external_plugin_mode():
-            return super()._create_python_model()
+            raise RuntimeError(
+                "ATOMQwen35Moe is only supported as an RTP external plugin."
+            )
 
         import atom
         from atom.model_loader.loader import load_model_in_plugin_mode
