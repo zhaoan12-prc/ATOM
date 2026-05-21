@@ -63,6 +63,7 @@ class _ATOMAttnPyObj:
 
     def __init__(self, runtime: "_ATOMQwen35MoeRuntime") -> None:
         self._runtime = runtime
+        self.is_cuda_graph = False
         self._rtp_full_attn_layers: list = []
         try:
             from atom.plugin.rtpllm.attention_backend import RTPAttention as _RTPAttn
@@ -320,12 +321,13 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         independently and never consults the RTP fmha_impl object — see
         rtp+atom_graph.md §4.1 (首要根因).
         """
-        del inputs
         if self._atom_attn_pyobj is None:
             self._atom_attn_pyobj = _ATOMAttnPyObj(self)
+        self._atom_attn_pyobj.is_cuda_graph = bool(is_cuda_graph)
         # Keep eager/non-graph path untouched: only prewarm when graph path
         # explicitly asks for fmha_impl in cuda-graph mode.
         if bool(is_cuda_graph):
+            inputs.attention_inputs.is_cuda_graph = True
             self._ensure_cuda_graph_prewarmed()
         return self._atom_attn_pyobj
 
@@ -421,6 +423,8 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         )
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
+        if bool(getattr(fmha_impl, "is_cuda_graph", False)):
+            inputs.attention_inputs.is_cuda_graph = True
         model_device = self._get_model_device()
         model_dtype = self._get_model_dtype()
         input_ids = inputs.input_ids
