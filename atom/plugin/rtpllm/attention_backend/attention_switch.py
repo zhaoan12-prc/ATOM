@@ -18,7 +18,6 @@ def apply_attention_mha_rtpllm_patch() -> None:
     from .rtp_full_attention import RTPFullAttention
 
     if is_rtpllm():
-        ops.RTPFullAttention = RTPFullAttention
         ops.Attention = RTPFullAttention
         logger.info(
             "Applied RTP-LLM attention patch: atom.model_ops.Attention -> RTPFullAttention."

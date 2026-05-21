@@ -1174,7 +1174,6 @@ class RTPForwardContext:
         attn_md = forward_context.attn_metadata
         attn_md.gdn_metadata = forward_context.gdn_metadata
         attn_md.rtp_attn_inputs = forward_context.rtp_attn_inputs
-        attn_md.rtp_seq_size_per_block = forward_context.rtp_seq_size_per_block
         attn_md.rtp_kernel_seq_size_per_block = (
             forward_context.rtp_kernel_seq_size_per_block
         )
