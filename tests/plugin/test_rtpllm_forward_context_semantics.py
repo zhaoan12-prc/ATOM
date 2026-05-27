@@ -4,7 +4,9 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
 import torch
+from aiter import dtypes
 
 
 class _KwargsObject:
@@ -197,6 +199,22 @@ def test_collect_layer_maps_keeps_sparse_mla_owner_for_indexer_cache():
     assert mla_map == {7: sparse_owner}
 
 
+def test_collect_layer_maps_recognizes_atom_mla_wrapper_by_indexer_and_mla_attn():
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
+
+    inner_mla = RTPMLAAttention(dense_backend=object(), layer_num=9)
+    atom_wrapper = SimpleNamespace(
+        layer_num=9,
+        indexer=SimpleNamespace(),
+        mla_attn=inner_mla,
+    )
+    model = SimpleNamespace(modules=lambda: [atom_wrapper])
+
+    _, _, mla_map = RTPForwardContext.collect_layer_maps(model)
+
+    assert mla_map == {9: atom_wrapper}
+
+
 def test_build_kv_cache_tensors_threads_raw_layer_cache_for_mla():
     from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
 
@@ -231,6 +249,7 @@ def test_bind_temporarily_attaches_mla_layer_cache(monkeypatch):
         context=SimpleNamespace(),
         num_tokens=1,
         mla_layer_map={7: mla_layer},
+        use_rtp_indexer_cache=False,
     )
 
     monkeypatch.setattr(
@@ -252,6 +271,59 @@ def test_bind_temporarily_attaches_mla_layer_cache(monkeypatch):
         assert mla_layer.kv_cache is new_cache
 
     assert mla_layer.kv_cache is old_cache
+
+
+def test_bind_writes_kv_cache_to_mla_attn_owner_not_outer_wrapper(monkeypatch):
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
+
+    outer_cache = SimpleNamespace(name="outer-cache")
+    old_inner_cache = SimpleNamespace(name="old-inner-cache")
+    new_cache = SimpleNamespace(kv_cache_base=torch.empty(2, 3))
+    indexer = SimpleNamespace(
+        head_dim=128,
+        k_cache=SimpleNamespace(kv_cache=[torch.empty(0)]),
+    )
+    mla_layer = RTPMLAAttention(
+        dense_backend=object(),
+        layer_num=7,
+        kv_cache=old_inner_cache,
+    )
+    outer = SimpleNamespace(
+        layer_num=7,
+        indexer=indexer,
+        mla_attn=mla_layer,
+        kv_cache=outer_cache,
+    )
+    forward_context = SimpleNamespace(
+        attn_metadata=SimpleNamespace(),
+        gdn_metadata=SimpleNamespace(),
+        rtp_attn_inputs=SimpleNamespace(),
+        rtp_kernel_seq_size_per_block=16,
+        layer_group_map={},
+        kv_cache_data={"layer_7": SimpleNamespace(k_cache=new_cache)},
+        context=SimpleNamespace(),
+        num_tokens=1,
+        mla_layer_map={7: outer},
+        use_rtp_indexer_cache=False,
+    )
+
+    monkeypatch.setattr(
+        RTPForwardContext,
+        "build",
+        classmethod(lambda cls, **kwargs: forward_context),
+    )
+
+    with RTPForwardContext.bind(
+        model=SimpleNamespace(),
+        runtime=SimpleNamespace(),
+        inputs=SimpleNamespace(),
+        positions=torch.tensor([0], dtype=torch.int32),
+    ):
+        assert outer.kv_cache is outer_cache
+        assert mla_layer.kv_cache is new_cache
+
+    assert outer.kv_cache is outer_cache
+    assert mla_layer.kv_cache is old_inner_cache
 
 
 def test_bind_temporarily_attaches_sparse_mla_indexer_cache(monkeypatch):
@@ -280,6 +352,7 @@ def test_bind_temporarily_attaches_sparse_mla_indexer_cache(monkeypatch):
         context=SimpleNamespace(),
         num_tokens=1,
         mla_layer_map={7: mla_layer},
+        use_rtp_indexer_cache=False,
     )
 
     monkeypatch.setattr(
@@ -304,3 +377,147 @@ def test_bind_temporarily_attaches_sparse_mla_indexer_cache(monkeypatch):
 
     assert mla_layer.kv_cache is old_cache
     assert indexer.k_cache.kv_cache[0] is old_index_cache
+
+
+def test_bind_uses_rtp_kv_scale_base_when_enabled(monkeypatch):
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
+
+    old_cache = SimpleNamespace(name="old-cache")
+    old_index_cache = torch.empty(0)
+    kv_scale_base = torch.empty(2, 16, 132, dtype=dtypes.fp8)
+    layer_cache = SimpleNamespace(
+        kv_cache_base=torch.empty(2, 3),
+        kv_scale_base=kv_scale_base,
+    )
+    indexer = SimpleNamespace(
+        head_dim=128,
+        k_cache=SimpleNamespace(kv_cache=[old_index_cache]),
+    )
+    mla_layer = RTPMLAAttention(
+        dense_backend=object(),
+        layer_num=7,
+        kv_cache=old_cache,
+        mla_modules=SimpleNamespace(indexer=indexer),
+    )
+    forward_context = SimpleNamespace(
+        attn_metadata=SimpleNamespace(),
+        gdn_metadata=SimpleNamespace(),
+        rtp_attn_inputs=SimpleNamespace(),
+        rtp_kernel_seq_size_per_block=16,
+        layer_group_map={},
+        kv_cache_data={"layer_7": SimpleNamespace(k_cache=layer_cache)},
+        context=SimpleNamespace(),
+        num_tokens=1,
+        mla_layer_map={7: mla_layer},
+        use_rtp_indexer_cache=True,
+    )
+
+    monkeypatch.setattr(
+        RTPForwardContext,
+        "build",
+        classmethod(lambda cls, **kwargs: forward_context),
+    )
+
+    with RTPForwardContext.bind(
+        model=SimpleNamespace(),
+        runtime=SimpleNamespace(),
+        inputs=SimpleNamespace(),
+        positions=torch.tensor([0], dtype=torch.int32),
+    ):
+        assert indexer.k_cache.kv_cache[0] is kv_scale_base
+
+    assert indexer.k_cache.kv_cache[0] is old_index_cache
+
+
+def test_bind_accepts_flattened_rtp_kv_scale_base_when_enabled(monkeypatch):
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
+
+    old_index_cache = torch.empty(0)
+    flat_kv_scale_base = torch.empty(2, 16 * 132, dtype=dtypes.fp8)
+    layer_cache = SimpleNamespace(
+        kv_cache_base=torch.empty(2, 3),
+        kv_scale_base=flat_kv_scale_base,
+    )
+    indexer = SimpleNamespace(
+        head_dim=128,
+        k_cache=SimpleNamespace(kv_cache=[old_index_cache]),
+    )
+    mla_layer = RTPMLAAttention(
+        dense_backend=object(),
+        layer_num=7,
+        mla_modules=SimpleNamespace(indexer=indexer),
+    )
+    forward_context = SimpleNamespace(
+        attn_metadata=SimpleNamespace(),
+        gdn_metadata=SimpleNamespace(),
+        rtp_attn_inputs=SimpleNamespace(),
+        rtp_kernel_seq_size_per_block=16,
+        layer_group_map={},
+        kv_cache_data={"layer_7": SimpleNamespace(k_cache=layer_cache)},
+        context=SimpleNamespace(),
+        num_tokens=1,
+        mla_layer_map={7: mla_layer},
+        use_rtp_indexer_cache=True,
+    )
+
+    monkeypatch.setattr(
+        RTPForwardContext,
+        "build",
+        classmethod(lambda cls, **kwargs: forward_context),
+    )
+
+    with RTPForwardContext.bind(
+        model=SimpleNamespace(),
+        runtime=SimpleNamespace(),
+        inputs=SimpleNamespace(),
+        positions=torch.tensor([0], dtype=torch.int32),
+    ):
+        assert indexer.k_cache.kv_cache[0].data_ptr() == flat_kv_scale_base.data_ptr()
+        assert indexer.k_cache.kv_cache[0].shape == (2, 16, 132)
+
+    assert indexer.k_cache.kv_cache[0] is old_index_cache
+
+
+def test_bind_rejects_incompatible_indexer_cache_layout(monkeypatch):
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
+
+    layer_cache = SimpleNamespace(
+        kv_cache_base=torch.empty(2, 3),
+        kv_scale_base=torch.empty(2, 16, 64, dtype=dtypes.fp8),
+    )
+    indexer = SimpleNamespace(
+        head_dim=128,
+        k_cache=SimpleNamespace(kv_cache=[torch.empty(0)]),
+    )
+    mla_layer = RTPMLAAttention(
+        dense_backend=object(),
+        layer_num=7,
+        mla_modules=SimpleNamespace(indexer=indexer),
+    )
+    forward_context = SimpleNamespace(
+        attn_metadata=SimpleNamespace(),
+        gdn_metadata=SimpleNamespace(),
+        rtp_attn_inputs=SimpleNamespace(),
+        rtp_kernel_seq_size_per_block=16,
+        layer_group_map={},
+        kv_cache_data={"layer_7": SimpleNamespace(k_cache=layer_cache)},
+        context=SimpleNamespace(),
+        num_tokens=1,
+        mla_layer_map={7: mla_layer},
+        use_rtp_indexer_cache=True,
+    )
+
+    monkeypatch.setattr(
+        RTPForwardContext,
+        "build",
+        classmethod(lambda cls, **kwargs: forward_context),
+    )
+
+    with pytest.raises(ValueError, match="layout mismatch"):
+        with RTPForwardContext.bind(
+            model=SimpleNamespace(),
+            runtime=SimpleNamespace(),
+            inputs=SimpleNamespace(),
+            positions=torch.tensor([0], dtype=torch.int32),
+        ):
+            pass

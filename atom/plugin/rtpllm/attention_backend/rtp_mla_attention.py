@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 
 
-class _M0DenseBackend:
+class _ZeroAttentionBackend:
     def __init__(self, v_head_dim: int) -> None:
         self.v_head_dim = int(v_head_dim)
 
@@ -97,7 +97,7 @@ class RTPMLAAttention:
             )
 
             self.dense_backend = RTPSparseMlaBackend(
-                dense_backend=_M0DenseBackend(mla_modules.v_head_dim),
+                dense_backend=_ZeroAttentionBackend(mla_modules.v_head_dim),
                 v_head_dim=mla_modules.v_head_dim,
             )
         else:
