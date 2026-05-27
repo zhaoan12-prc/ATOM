@@ -235,6 +235,9 @@ def test_rtp_mla_attention_builds_m0_backend_from_mla_modules():
 
 def test_rtp_mla_attention_defaults_to_sparse_backend_from_mla_modules(monkeypatch):
     _guard_sparse_kernel_imports(monkeypatch)
+    from atom.plugin.rtpllm.attention_backend.rtp_dense_mla_backend import (
+        RTPDenseMlaBackend,
+    )
     from atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend import (
         RTPSparseMlaBackend,
     )
@@ -243,6 +246,60 @@ def test_rtp_mla_attention_defaults_to_sparse_backend_from_mla_modules(monkeypat
     attention = RTPMLAAttention(mla_modules=modules, layer_num=3)
 
     assert isinstance(attention.dense_backend, RTPSparseMlaBackend)
+    assert isinstance(attention.dense_backend.dense_backend, RTPDenseMlaBackend)
+
+
+class _FakeKVProj:
+    def __init__(self, output: torch.Tensor):
+        self.output = output
+        self.calls = []
+
+    def __call__(self, compressed_kv):
+        self.calls.append(compressed_kv)
+        return self.output.to(device=compressed_kv.device, dtype=compressed_kv.dtype)
+
+
+def test_default_dense_mla_backend_computes_nonzero_attention(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    from atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend import (
+        RTPSparseMlaBackend,
+    )
+
+    q = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]], dtype=torch.float32)
+    compressed_kv = torch.ones(2, 4, dtype=torch.float32)
+    # Per token: [k_nope_dim=2, v_head_dim=1].
+    kv_projection = torch.tensor([[1.0, 0.0, 5.0], [0.0, 1.0, 7.0]])
+    modules = SimpleNamespace(
+        v_head_dim=1,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=0,
+        kv_b_proj=_FakeKVProj(kv_projection),
+    )
+    attention = RTPMLAAttention(mla_modules=modules, layer_num=3)
+
+    output = attention(q, compressed_kv, q.new_empty((2, 0)), positions=torch.arange(2))
+
+    assert isinstance(attention.dense_backend, RTPSparseMlaBackend)
+    assert output.shape == (2, 1, 1)
+    assert not torch.equal(output, torch.zeros_like(output))
+    assert len(modules.kv_b_proj.calls) == 1
+    assert modules.kv_b_proj.calls[0] is compressed_kv
+
+
+def test_default_dense_mla_backend_rejects_bad_kv_projection_shape(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    q = torch.randn(2, 1, 2)
+    compressed_kv = torch.ones(2, 4)
+    modules = SimpleNamespace(
+        v_head_dim=1,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=0,
+        kv_b_proj=_FakeKVProj(torch.empty(2, 2)),
+    )
+    attention = RTPMLAAttention(mla_modules=modules, layer_num=3)
+
+    with pytest.raises(ValueError, match="kv_b_proj output shape mismatch"):
+        attention(q, compressed_kv, q.new_empty((2, 0)), positions=torch.arange(2))
 
 
 def test_rtp_mla_attention_explicit_dense_backend_overrides_sparse_default(monkeypatch):

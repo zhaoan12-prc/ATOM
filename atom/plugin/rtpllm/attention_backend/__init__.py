@@ -1,3 +1,4 @@
+from .rtp_dense_mla_backend import RTPDenseMlaBackend
 from .rtp_mla_attention import RTPMLAAttention, apply_attention_mla_rtpllm_patch
 from .rtp_mla_metadata import (
     GLM5_RTP_BRIDGE_MODE,
@@ -26,6 +27,7 @@ def __getattr__(name):
 __all__ = [
     "RTPAttention",
     "RTPFullAttention",
+    "RTPDenseMlaBackend",
     "RTPMLAAttention",
     "RTPSparseMlaBackend",
     "GLM5_RTP_BRIDGE_MODE",
