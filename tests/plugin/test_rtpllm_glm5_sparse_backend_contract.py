@@ -3,6 +3,7 @@
 import builtins
 import importlib
 import inspect
+import sys
 from types import SimpleNamespace
 
 import torch
@@ -175,7 +176,7 @@ def test_sparse_backend_threads_kv_cache_and_layer_id_to_sparse_impl(monkeypatch
 
 def test_sparse_backend_pulls_attn_metadata_from_forward_context(monkeypatch):
     backend_cls = _load_sparse_backend(monkeypatch)
-    from atom.utils import forward_context as forward_context_mod
+    forward_context_mod = sys.modules["atom.utils.forward_context"]
 
     attn_metadata = SimpleNamespace(block_table="block-table", seq_lens="seq-lens")
     fake_forward_context = SimpleNamespace(
@@ -186,6 +187,7 @@ def test_sparse_backend_pulls_attn_metadata_from_forward_context(monkeypatch):
         forward_context_mod,
         "get_forward_context",
         lambda: fake_forward_context,
+        raising=False,
     )
     dense_backend = _FakeDenseBackend()
     sparse_impl = _FakeSparseImpl()

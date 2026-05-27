@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Tuple
 
 import torch
+from aiter import dtypes
 
 from atom.config import KVCacheTensor, get_current_atom_config
 from atom.model_ops.attention_gdn import GatedDeltaNet
@@ -41,7 +42,8 @@ class RTPForwardContext:
     layer_group_map: Dict[int, int]
     context: Context
     num_tokens: int
-    LayerMaps = tuple[Dict[int, GatedDeltaNet], Dict[int, Any]]
+    mla_layer_map: Dict[int, Any]
+    LayerMaps = tuple[Dict[int, GatedDeltaNet], Dict[int, Any], Dict[int, Any]]
 
     @staticmethod
     def _non_empty_int32(
@@ -953,17 +955,41 @@ class RTPForwardContext:
     def collect_layer_maps(model: Any) -> LayerMaps:
         gdn_layer_map: Dict[int, GatedDeltaNet] = {}
         full_attn_layer_map: Dict[int, Any] = {}
+        mla_layer_map: Dict[int, Any] = {}
         rtp_attention_cls: type[Any] | None = None
+        rtp_mla_attention_cls: type[Any] | None = None
+        try:
+            from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import (
+                RTPMLAAttention,
+            )
+
+            rtp_mla_attention_cls = RTPMLAAttention
+        except (ImportError, ModuleNotFoundError):
+            rtp_mla_attention_cls = None
         try:
             from atom.plugin.rtpllm.attention_backend import RTPAttention
 
             rtp_attention_cls = RTPAttention
-        except (ImportError, ModuleNotFoundError):
+        except Exception:
             rtp_attention_cls = None
 
         for module in model.modules():
             if isinstance(module, GatedDeltaNet):
                 gdn_layer_map[int(module.layer_num)] = module
+            elif (
+                getattr(module, "indexer", None) is not None
+                and getattr(module, "mla_attn", None) is not None
+                and getattr(module, "layer_num", None) is not None
+            ):
+                mla_layer_map[int(module.layer_num)] = module
+            elif rtp_mla_attention_cls is not None and isinstance(
+                module, rtp_mla_attention_cls
+            ):
+                layer_num = getattr(module, "layer_id", None)
+                if layer_num is None:
+                    layer_num = getattr(module, "layer_num", None)
+                if layer_num is not None and int(layer_num) not in mla_layer_map:
+                    mla_layer_map[int(layer_num)] = module
             elif isinstance(module, PagedAttention) or (
                 rtp_attention_cls is not None and isinstance(module, rtp_attention_cls)
             ):
@@ -973,7 +999,7 @@ class RTPForwardContext:
                     layer_num = getattr(module, "layer_num", None)
                 if layer_num is not None:
                     full_attn_layer_map[int(layer_num)] = module
-        return gdn_layer_map, full_attn_layer_map
+        return gdn_layer_map, full_attn_layer_map, mla_layer_map
 
     @staticmethod
     def _build_kv_cache_tensors(
@@ -983,9 +1009,9 @@ class RTPForwardContext:
         if runtime.kv_cache is None:
             raise ValueError("RTP plugin requires initialized kv_cache for ATOM model.")
 
-        gdn_layer_map, full_attn_layer_map = layer_maps
+        gdn_layer_map, full_attn_layer_map, mla_layer_map = layer_maps
 
-        if not gdn_layer_map and not full_attn_layer_map:
+        if not gdn_layer_map and not full_attn_layer_map and not mla_layer_map:
             return {}
 
         cache_tensors: Dict[str, KVCacheTensor] = {}
@@ -1076,6 +1102,31 @@ class RTPForwardContext:
                 k_scale=None,
                 v_scale=None,
             )
+        # Build MLA cache references separately from full attention. MLA adapters
+        # own their kv_cache pointer and refresh it in bind() for every forward.
+        for layer_num in mla_layer_map.keys():
+            layer_key = f"layer_{layer_num}"
+            if layer_key in cache_tensors:
+                continue
+
+            layer_cache = runtime.kv_cache.get_layer_cache(layer_num)
+            kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
+            if kv_cache_base is None:
+                raise ValueError(
+                    f"Layer {layer_num} kv_cache_base is missing for MLA cache."
+                )
+            if kv_cache_base.dim() < 1:
+                raise ValueError(
+                    f"Layer {layer_num} MLA kv_cache_base has invalid shape "
+                    f"{tuple(kv_cache_base.shape)}."
+                )
+            cache_tensors[layer_key] = KVCacheTensor(
+                layer_num=layer_num,
+                k_cache=layer_cache,
+                v_cache=None,
+                k_scale=None,
+                v_scale=None,
+            )
         return cache_tensors
 
     @staticmethod
@@ -1085,10 +1136,12 @@ class RTPForwardContext:
     ) -> Tuple[Any, ...]:
         if runtime.kv_cache is None:
             return ("no_kv_cache",)
-        gdn_layer_map, full_attn_layer_map = layer_maps
+        gdn_layer_map, full_attn_layer_map, mla_layer_map = layer_maps
         signature: list[Any] = [id(runtime.kv_cache)]
         all_layer_nums = sorted(
-            set(gdn_layer_map.keys()) | set(full_attn_layer_map.keys())
+            set(gdn_layer_map.keys())
+            | set(full_attn_layer_map.keys())
+            | set(mla_layer_map.keys())
         )
         for layer_num in all_layer_nums:
             layer_cache = runtime.kv_cache.get_layer_cache(layer_num)
@@ -1201,7 +1254,63 @@ class RTPForwardContext:
             layer_group_map=layer_group_map,
             context=context,
             num_tokens=int(positions.numel()),
+            mla_layer_map=resolved_layer_maps[2],
         )
+
+    @staticmethod
+    def _attach_mla_layer_caches(
+        forward_context: "RTPForwardContext",
+    ) -> tuple[list[tuple[Any, str, Any]], list[tuple[list[Any], int, Any]]]:
+        restore_attrs: list[tuple[Any, str, Any]] = []
+        restore_indices: list[tuple[list[Any], int, Any]] = []
+        for layer_num, layer in forward_context.mla_layer_map.items():
+            cache_tensor = forward_context.kv_cache_data.get(f"layer_{layer_num}")
+            if cache_tensor is None:
+                continue
+            cache_owner = getattr(layer, "mla_attn", layer)
+            restore_attrs.append(
+                (cache_owner, "kv_cache", getattr(cache_owner, "kv_cache", None))
+            )
+            cache_owner.kv_cache = cache_tensor.k_cache
+            indexer = getattr(layer, "indexer", None)
+            if indexer is None:
+                indexer = getattr(cache_owner, "indexer", None)
+            indexer_cache = getattr(indexer, "k_cache", None)
+            indexer_kv_cache = getattr(indexer_cache, "kv_cache", None)
+            if not isinstance(indexer_kv_cache, list) or not indexer_kv_cache:
+                continue
+            layer_cache = cache_tensor.k_cache
+            kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
+            if kv_cache_base is None or kv_cache_base.dim() == 0:
+                continue
+            block_size = int(
+                forward_context.rtp_kernel_seq_size_per_block
+                or getattr(get_current_atom_config(), "kv_cache_block_size", 0)
+                or 1
+            )
+            index_dim = int(getattr(indexer, "head_dim", 0) or 0) + 4
+            if index_dim <= 4:
+                continue
+            aligned_dim = ((index_dim + 15) // 16) * 16
+            num_tokens = int(kv_cache_base.shape[0]) * block_size
+            cached = getattr(cache_owner, "_rtp_indexer_kv_cache", None)
+            fp8_dtype = dtypes.fp8
+            expected_shape = (num_tokens, 1, aligned_dim)
+            if (
+                cached is None
+                or tuple(cached.shape) != expected_shape
+                or cached.device != kv_cache_base.device
+                or cached.dtype != fp8_dtype
+            ):
+                cached = torch.empty(
+                    expected_shape,
+                    device=kv_cache_base.device,
+                    dtype=fp8_dtype,
+                )
+                setattr(cache_owner, "_rtp_indexer_kv_cache", cached)
+            restore_indices.append((indexer_kv_cache, 0, indexer_kv_cache[0]))
+            indexer_kv_cache[0] = cached
+        return restore_attrs, restore_indices
 
     @classmethod
     @contextmanager
@@ -1233,7 +1342,12 @@ class RTPForwardContext:
             forward_context.rtp_kernel_seq_size_per_block
         )
         attn_md.rtp_layer_group_map = forward_context.layer_group_map
+        restore_mla_attrs: list[tuple[Any, str, Any]] = []
+        restore_mla_indices: list[tuple[list[Any], int, Any]] = []
         try:
+            restore_mla_attrs, restore_mla_indices = cls._attach_mla_layer_caches(
+                forward_context
+            )
             set_kv_cache_data(forward_context.kv_cache_data)
             set_forward_context(
                 attn_metadata=attn_md,
@@ -1243,5 +1357,9 @@ class RTPForwardContext:
             )
             yield
         finally:
+            for target, index, old_cache in reversed(restore_mla_indices):
+                target[index] = old_cache
+            for target, attr, old_cache in reversed(restore_mla_attrs):
+                setattr(target, attr, old_cache)
             reset_forward_context()
             set_kv_cache_data(prev_kv if prev_kv is not None else {})
