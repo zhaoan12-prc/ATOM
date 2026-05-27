@@ -48,6 +48,10 @@ def _install_fake_rtp_modules() -> dict[str, ModuleType]:
     class _FakeModelWeights:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.global_weights = {}
+
+        def set_global_weight(self, name, tensor):
+            self.global_weights[name] = tensor
 
     fake_weight_info_mod.ModelWeights = _FakeModelWeights
 
@@ -73,7 +77,8 @@ def _install_fake_rtp_modules() -> dict[str, ModuleType]:
         pass
 
     class _FakePyModelOutputs:
-        pass
+        def __init__(self, hidden_states):
+            self.hidden_states = hidden_states
 
     fake_compute_ops_mod.PyModelInputs = _FakePyModelInputs
     fake_compute_ops_mod.PyModelOutputs = _FakePyModelOutputs
@@ -190,4 +195,126 @@ def test_glm5_create_python_model_lets_prepare_model_own_mla_patching():
         ].load_model_in_plugin_mode
         load_model_in_plugin_mode.assert_called_once()
         assert result is instance.py_model
+
+
+def test_glm5_support_cuda_graph_honors_eager_env():
+    fake_modules = _install_fake_rtp_modules()
+
+    with patch.dict(sys.modules, fake_modules), patch.dict(
+        os.environ,
+        {
+            "RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models",
+            "ENABLE_CUDA_GRAPH": "0",
+        },
+    ):
+        sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
+        module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
+        module = importlib.reload(module)
+        instance = _make_wrapper_instance(module.ATOMGlm5Moe)
+
+        assert instance.support_cuda_graph() is False
+
+
+def test_glm5_runtime_forward_wraps_model_call_in_rtp_context(monkeypatch):
+    fake_modules = _install_fake_rtp_modules()
+    expected_input_ids = torch.tensor([10, 11], dtype=torch.int64)
+    position_ids = torch.tensor([5, 6], dtype=torch.int32)
+    hidden_states = torch.randn(2, 4)
+    events = []
+
+    class _FakeAtomModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, *, input_ids, positions, intermediate_tensors, inputs_embeds):
+            events.append(("model", bool(_FakeRTPForwardContext.in_context)))
+            assert torch.equal(input_ids, expected_input_ids)
+            assert torch.equal(positions, position_ids.to(torch.long))
+            assert positions.dtype == torch.long
+            assert intermediate_tensors is None
+            assert inputs_embeds is None
+            return hidden_states
+
+    class _FakeBind:
+        def __enter__(self):
+            _FakeRTPForwardContext.in_context = True
+            events.append(("enter", None))
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append(("exit", None))
+            _FakeRTPForwardContext.in_context = False
+
+    class _FakeRTPForwardContext:
+        in_context = False
+
+        @staticmethod
+        def collect_layer_maps(model):
+            return ({}, {}, {})
+
+        @staticmethod
+        def bind(**kwargs):
+            assert torch.equal(kwargs["positions"], position_ids.to(torch.long))
+            assert kwargs["positions"].dtype == torch.long
+            return _FakeBind()
+
+    with patch.dict(sys.modules, fake_modules), patch.dict(
+        os.environ,
+        {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+    ):
+        sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
+        module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
+        module = importlib.reload(module)
+        monkeypatch.setattr(module, "RTPForwardContext", _FakeRTPForwardContext)
+        runtime = module._ATOMGlm5MoeRuntime(
+            model_config=SimpleNamespace(max_seq_len=16),
+            parallelism_config=SimpleNamespace(),
+            weights=MagicMock(),
+            max_generate_batch_size=2,
+            atom_model=_FakeAtomModel(),
+        )
+        runtime.kv_cache = SimpleNamespace()
+        inputs = SimpleNamespace(
+            input_ids=expected_input_ids,
+            input_hiddens=None,
+            attention_inputs=SimpleNamespace(position_ids=position_ids),
+        )
+
+        output = runtime.forward(inputs)
+
+    assert output.hidden_states is hidden_states
+    assert events == [("enter", None), ("model", True), ("exit", None)]
+
+
+def test_glm5_runtime_prepare_fmha_impl_bypasses_native_mla_factory(monkeypatch):
+    fake_modules = _install_fake_rtp_modules()
+
+    class _FakeRTPForwardContext:
+        @staticmethod
+        def collect_layer_maps(model):
+            return ({}, {}, {})
+
+    with patch.dict(sys.modules, fake_modules), patch.dict(
+        os.environ,
+        {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+    ):
+        sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
+        module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
+        module = importlib.reload(module)
+        monkeypatch.setattr(module, "RTPForwardContext", _FakeRTPForwardContext)
+        atom_model = torch.nn.Linear(1, 1)
+        runtime = module._ATOMGlm5MoeRuntime(
+            model_config=SimpleNamespace(max_seq_len=16),
+            parallelism_config=SimpleNamespace(),
+            weights=MagicMock(),
+            max_generate_batch_size=2,
+            atom_model=atom_model,
+        )
+        inputs = SimpleNamespace(attention_inputs=SimpleNamespace())
+
+        attn_pyobj = runtime.prepare_fmha_impl(inputs, is_cuda_graph=False)
+
+    assert attn_pyobj.fmha_params is None
+    assert attn_pyobj.is_cuda_graph is False
+    assert hasattr(attn_pyobj, "prepare_cuda_graph")
 

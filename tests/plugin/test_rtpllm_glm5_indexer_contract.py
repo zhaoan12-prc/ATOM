@@ -1,6 +1,7 @@
 """Contract-executable tests for GLM5 RTP MLA M1.5 indexer behavior."""
 
 import builtins
+import sys
 from types import SimpleNamespace
 
 import torch
@@ -161,7 +162,7 @@ def test_indexer_buffer_topk_is_passed_to_dense_backend_when_emit_allowed(monkey
 
 
 def _patch_forward_context(monkeypatch, *, is_dummy_run, is_prefill, max_seqlen_k):
-    from atom.utils import forward_context as forward_context_mod
+    forward_context_mod = sys.modules["atom.utils.forward_context"]
 
     fake_forward_context = SimpleNamespace(
         context=SimpleNamespace(is_dummy_run=is_dummy_run, is_prefill=is_prefill),
@@ -171,6 +172,7 @@ def _patch_forward_context(monkeypatch, *, is_dummy_run, is_prefill, max_seqlen_
         forward_context_mod,
         "get_forward_context",
         lambda: fake_forward_context,
+        raising=False,
     )
 
 

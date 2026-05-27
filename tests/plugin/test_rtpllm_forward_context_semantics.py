@@ -40,10 +40,15 @@ def _install_forward_context_stubs():
     utils_forward_context = types.ModuleType("atom.utils.forward_context")
     utils_forward_context.AttentionMetaData = _KwargsObject
     utils_forward_context.Context = _KwargsObject
-    utils_forward_context._forward_kv_cache_context = {}
+    utils_forward_context._forward_kv_cache_context = SimpleNamespace(kv_cache_data={})
     utils_forward_context.reset_forward_context = lambda *args, **kwargs: None
     utils_forward_context.set_forward_context = lambda *args, **kwargs: None
-    utils_forward_context.set_kv_cache_data = lambda *args, **kwargs: None
+    utils_forward_context.get_forward_context = lambda *args, **kwargs: SimpleNamespace()
+
+    def _set_kv_cache_data(value):
+        utils_forward_context._forward_kv_cache_context.kv_cache_data = value
+
+    utils_forward_context.set_kv_cache_data = _set_kv_cache_data
     sys.modules["atom.utils.forward_context"] = utils_forward_context
 
 
@@ -159,3 +164,143 @@ def test_rtpllm_decode_seq_lens_priority_splits_graph_and_eager_modes():
         graph_inputs, device=input_lengths.device
     )
     assert graph_seq_lens.cpu().tolist() == [36]
+
+
+def test_collect_layer_maps_keeps_mla_layers_separate():
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
+
+    mla_layer = RTPMLAAttention(dense_backend=object(), layer_num=7)
+    model = SimpleNamespace(modules=lambda: [mla_layer])
+
+    gdn_map, full_attn_map, mla_map = RTPForwardContext.collect_layer_maps(model)
+
+    assert gdn_map == {}
+    assert full_attn_map == {}
+    assert mla_map == {7: mla_layer}
+
+
+def test_collect_layer_maps_keeps_sparse_mla_owner_for_indexer_cache():
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
+
+    mla_layer = RTPMLAAttention(dense_backend=object(), layer_num=7)
+    sparse_owner = SimpleNamespace(
+        layer_num=7,
+        indexer=SimpleNamespace(),
+        mla_attn=mla_layer,
+    )
+    model = SimpleNamespace(modules=lambda: [sparse_owner, mla_layer])
+
+    gdn_map, full_attn_map, mla_map = RTPForwardContext.collect_layer_maps(model)
+
+    assert gdn_map == {}
+    assert full_attn_map == {}
+    assert mla_map == {7: sparse_owner}
+
+
+def test_build_kv_cache_tensors_threads_raw_layer_cache_for_mla():
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
+
+    layer_cache = SimpleNamespace(kv_cache_base=torch.empty(2, 3))
+    runtime = SimpleNamespace(
+        kv_cache=SimpleNamespace(get_layer_cache=lambda layer_num: layer_cache)
+    )
+    mla_layer = RTPMLAAttention(dense_backend=object(), layer_num=7)
+
+    cache_tensors = RTPForwardContext._build_kv_cache_tensors(
+        runtime=runtime,
+        layer_maps=({}, {}, {7: mla_layer}),
+    )
+
+    assert cache_tensors["layer_7"].layer_num == 7
+    assert cache_tensors["layer_7"].k_cache is layer_cache
+
+
+def test_bind_temporarily_attaches_mla_layer_cache(monkeypatch):
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
+
+    old_cache = SimpleNamespace(name="old-cache")
+    new_cache = SimpleNamespace(name="new-cache")
+    mla_layer = RTPMLAAttention(dense_backend=object(), layer_num=7, kv_cache=old_cache)
+    forward_context = SimpleNamespace(
+        attn_metadata=SimpleNamespace(),
+        gdn_metadata=SimpleNamespace(),
+        rtp_attn_inputs=SimpleNamespace(),
+        rtp_kernel_seq_size_per_block=16,
+        layer_group_map={},
+        kv_cache_data={"layer_7": SimpleNamespace(k_cache=new_cache)},
+        context=SimpleNamespace(),
+        num_tokens=1,
+        mla_layer_map={7: mla_layer},
+    )
+
+    monkeypatch.setattr(
+        RTPForwardContext,
+        "build",
+        classmethod(lambda cls, **kwargs: forward_context),
+    )
+    monkeypatch.setattr(
+        "atom.plugin.rtpllm.utils.forward_context.get_current_atom_config",
+        lambda: SimpleNamespace(kv_cache_block_size=99),
+    )
+
+    with RTPForwardContext.bind(
+        model=SimpleNamespace(),
+        runtime=SimpleNamespace(),
+        inputs=SimpleNamespace(),
+        positions=torch.tensor([0], dtype=torch.int32),
+    ):
+        assert mla_layer.kv_cache is new_cache
+
+    assert mla_layer.kv_cache is old_cache
+
+
+def test_bind_temporarily_attaches_sparse_mla_indexer_cache(monkeypatch):
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
+
+    old_cache = SimpleNamespace(name="old-cache")
+    layer_cache = SimpleNamespace(kv_cache_base=torch.empty(2, 3))
+    old_index_cache = torch.empty(0)
+    indexer = SimpleNamespace(
+        head_dim=128,
+        k_cache=SimpleNamespace(kv_cache=[old_index_cache]),
+    )
+    mla_layer = RTPMLAAttention(
+        dense_backend=object(),
+        layer_num=7,
+        kv_cache=old_cache,
+        mla_modules=SimpleNamespace(indexer=indexer),
+    )
+    forward_context = SimpleNamespace(
+        attn_metadata=SimpleNamespace(),
+        gdn_metadata=SimpleNamespace(),
+        rtp_attn_inputs=SimpleNamespace(),
+        rtp_kernel_seq_size_per_block=16,
+        layer_group_map={},
+        kv_cache_data={"layer_7": SimpleNamespace(k_cache=layer_cache)},
+        context=SimpleNamespace(),
+        num_tokens=1,
+        mla_layer_map={7: mla_layer},
+    )
+
+    monkeypatch.setattr(
+        RTPForwardContext,
+        "build",
+        classmethod(lambda cls, **kwargs: forward_context),
+    )
+    monkeypatch.setattr(
+        "atom.plugin.rtpllm.utils.forward_context.get_current_atom_config",
+        lambda: SimpleNamespace(kv_cache_block_size=16),
+    )
+
+    with RTPForwardContext.bind(
+        model=SimpleNamespace(),
+        runtime=SimpleNamespace(),
+        inputs=SimpleNamespace(),
+        positions=torch.tensor([0], dtype=torch.int32),
+    ):
+        assert mla_layer.kv_cache is layer_cache
+        assert indexer.k_cache.kv_cache[0] is not old_index_cache
+        assert indexer.k_cache.kv_cache[0].shape == (32, 1, 144)
+
+    assert mla_layer.kv_cache is old_cache
+    assert indexer.k_cache.kv_cache[0] is old_index_cache
