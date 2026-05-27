@@ -2,9 +2,51 @@
 
 from __future__ import annotations
 
+import os
+from collections import deque
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
+
+
+_DEBUG_STATS: deque[dict[str, Any]] = deque(maxlen=256)
+_FP8_CACHE_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e4m3fn", None),
+        torch.uint8,
+    )
+    if dtype is not None
+)
+
+
+def reset_dense_mla_debug_stats() -> None:
+    _DEBUG_STATS.clear()
+
+
+def get_dense_mla_debug_stats() -> list[dict[str, Any]]:
+    return list(_DEBUG_STATS)
+
+
+def _debug_enabled() -> bool:
+    return os.getenv("ATOM_RTP_DENSE_MLA_DEBUG", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+@dataclass(frozen=True)
+class _DenseMlaMetadata:
+    query_start_loc: torch.Tensor
+    seq_lens: torch.Tensor | None
+    block_table: torch.Tensor | None
+    slot_mapping: torch.Tensor | None
+    is_prefill: bool
+    block_size: int
 
 
 class RTPDenseMlaBackend:
@@ -24,23 +66,78 @@ class RTPDenseMlaBackend:
         self._projection_checked = False
 
     @staticmethod
-    def _get_query_start_loc(num_tokens: int, device: torch.device) -> torch.Tensor:
+    def _read_is_prefill(context: Any) -> bool:
+        if context is None or not hasattr(context, "is_prefill"):
+            raise ValueError(
+                "GLM5 RTP dense MLA requires explicit context.is_prefill metadata."
+            )
+        return bool(getattr(context, "is_prefill"))
+
+    @staticmethod
+    def _get_metadata(num_tokens: int, device: torch.device) -> _DenseMlaMetadata:
+        attn_metadata = None
+        context = None
+        rtp_kernel_seq_size_per_block = 1
         try:
             from atom.utils.forward_context import get_forward_context
 
-            attn_metadata = getattr(get_forward_context(), "attn_metadata", None)
+            forward_context = get_forward_context()
+            attn_metadata = getattr(forward_context, "attn_metadata", None)
+            context = getattr(forward_context, "context", None)
+            rtp_kernel_seq_size_per_block = int(
+                getattr(attn_metadata, "rtp_kernel_seq_size_per_block", 0) or 0
+            )
             plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
             query_start_loc = getattr(plugin_metadata, "query_start_loc", None)
             if query_start_loc is None:
                 query_start_loc = getattr(plugin_metadata, "rtp_cu_seqlens_q", None)
+            seq_lens = getattr(plugin_metadata, "seq_lens", None)
+            block_table = getattr(plugin_metadata, "block_table", None)
+            slot_mapping = getattr(plugin_metadata, "slot_mapping", None)
         except Exception:
             query_start_loc = None
+            seq_lens = None
+            block_table = None
+            slot_mapping = None
 
         if query_start_loc is not None and int(query_start_loc.numel()) >= 2:
             query_start_loc = query_start_loc.to(device=device, dtype=torch.int64)
             if int(query_start_loc[0].item()) == 0 and int(query_start_loc[-1].item()) == num_tokens:
-                return query_start_loc
-        return torch.tensor([0, num_tokens], dtype=torch.int64, device=device)
+                is_prefill = RTPDenseMlaBackend._read_is_prefill(context)
+                return _DenseMlaMetadata(
+                    query_start_loc=query_start_loc,
+                    seq_lens=(
+                        seq_lens.to(device=device, dtype=torch.int64)
+                        if isinstance(seq_lens, torch.Tensor)
+                        else None
+                    ),
+                    block_table=(
+                        block_table.to(device=device, dtype=torch.int64)
+                        if isinstance(block_table, torch.Tensor)
+                        else None
+                    ),
+                    slot_mapping=(
+                        slot_mapping.to(device=device, dtype=torch.int64)
+                        if isinstance(slot_mapping, torch.Tensor)
+                        else None
+                    ),
+                    is_prefill=is_prefill,
+                    block_size=max(1, rtp_kernel_seq_size_per_block),
+                )
+        if num_tokens != 1:
+            raise ValueError(
+                "GLM5 RTP dense MLA requires query_start_loc metadata for "
+                f"multi-token batches (num_tokens={num_tokens})."
+            )
+        is_prefill = RTPDenseMlaBackend._read_is_prefill(context)
+        return _DenseMlaMetadata(
+            query_start_loc=torch.tensor([0, num_tokens], dtype=torch.int64, device=device),
+            seq_lens=None,
+            block_table=None,
+            slot_mapping=None,
+            is_prefill=is_prefill,
+            block_size=max(1, rtp_kernel_seq_size_per_block),
+        )
 
     @staticmethod
     def _unwrap_linear_output(value: Any) -> torch.Tensor:
@@ -58,7 +155,8 @@ class RTPDenseMlaBackend:
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         if self.kv_b_proj is None:
             return None
-        num_tokens, num_heads, qk_head_dim = q.shape
+        _, num_heads, qk_head_dim = q.shape
+        num_kv_tokens = int(compressed_kv.shape[0])
         rope_dim = int(self.qk_rope_head_dim or k_pe.shape[-1])
         nope_dim = int(self.qk_nope_head_dim or (qk_head_dim - rope_dim))
         if nope_dim <= 0:
@@ -80,11 +178,11 @@ class RTPDenseMlaBackend:
         if not self._projection_checked:
             self._projection_checked = True
 
-        kv_nope = kv_nope.reshape(num_tokens, num_heads, nope_dim + self.v_head_dim)
+        kv_nope = kv_nope.reshape(num_kv_tokens, num_heads, nope_dim + self.v_head_dim)
         k_nope, value = kv_nope.split([nope_dim, self.v_head_dim], dim=-1)
         if k_pe.dim() == 2:
             k_pe = k_pe.unsqueeze(1)
-        k_pe = k_pe.expand(num_tokens, num_heads, rope_dim)
+        k_pe = k_pe.expand(num_kv_tokens, num_heads, rope_dim)
         key = torch.cat((k_nope, k_pe), dim=-1)
         return key, value
 
@@ -117,6 +215,163 @@ class RTPDenseMlaBackend:
             return value.new_empty((0, value.shape[1], value.shape[2]))
         return torch.cat(pieces, dim=0)
 
+    @staticmethod
+    def _cross_causal_attention(
+        q: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        q_len = int(q.shape[0])
+        k_len = int(key.shape[0])
+        if q_len == 0:
+            return value.new_empty((0, value.shape[1], value.shape[2]))
+        if k_len < q_len:
+            raise ValueError(
+                f"GLM5 RTP dense MLA got invalid cross attention lengths: q={q_len}, k={k_len}."
+            )
+        scores = torch.einsum("tnd,snd->nts", q.float(), key.float()) * scale
+        q_pos = torch.arange(q_len, device=q.device).unsqueeze(1)
+        k_pos = torch.arange(k_len, device=q.device).unsqueeze(0)
+        causal_mask = k_pos <= (k_len - q_len + q_pos)
+        scores = scores.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        return torch.einsum("nts,snd->tnd", probs, value.float())
+
+    @staticmethod
+    def _flatten_latent_cache(
+        layer_cache: Any,
+        *,
+        block_size: int,
+        kv_dim: int,
+    ) -> torch.Tensor | None:
+        kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
+        if not isinstance(kv_cache_base, torch.Tensor) or kv_cache_base.numel() == 0:
+            return None
+        if kv_cache_base.dtype in _FP8_CACHE_DTYPES:
+            raise NotImplementedError(
+                "GLM5 RTP dense MLA reference path requires BF16/FP16 latent KV cache; "
+                "FP8 KV cache layout/dequant is not supported yet."
+            )
+        if kv_cache_base.dim() == 3 and int(kv_cache_base.shape[-1]) == kv_dim:
+            return kv_cache_base.reshape(-1, kv_dim)
+        if kv_cache_base.dim() == 2 and int(kv_cache_base.shape[1]) % block_size == 0:
+            per_token_dim = int(kv_cache_base.shape[1]) // block_size
+            if per_token_dim == kv_dim:
+                return kv_cache_base.view(kv_cache_base.shape[0], block_size, kv_dim).reshape(
+                    -1, kv_dim
+                )
+        return None
+
+    @staticmethod
+    def _write_current_to_cache(
+        *,
+        layer_cache: Any,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        metadata: _DenseMlaMetadata,
+        kv_dim: int,
+    ) -> None:
+        if metadata.slot_mapping is None:
+            return
+        flat_cache = RTPDenseMlaBackend._flatten_latent_cache(
+            layer_cache, block_size=metadata.block_size, kv_dim=kv_dim
+        )
+        if flat_cache is None:
+            return
+        latent = torch.cat((compressed_kv, k_pe), dim=-1)
+        if latent.shape[0] != metadata.slot_mapping.shape[0]:
+            return
+        flat_cache[metadata.slot_mapping[: latent.shape[0]].long()] = latent.to(
+            dtype=flat_cache.dtype
+        )
+
+    @staticmethod
+    def _gather_latent_history(
+        *,
+        layer_cache: Any,
+        metadata: _DenseMlaMetadata,
+        batch_idx: int,
+        kv_dim: int,
+    ) -> torch.Tensor | None:
+        if metadata.block_table is None or metadata.seq_lens is None:
+            return None
+        flat_cache = RTPDenseMlaBackend._flatten_latent_cache(
+            layer_cache, block_size=metadata.block_size, kv_dim=kv_dim
+        )
+        if flat_cache is None:
+            return None
+        seq_len = int(metadata.seq_lens[batch_idx].item())
+        if seq_len <= 0:
+            return None
+        block_row = metadata.block_table[batch_idx].long()
+        positions = torch.arange(seq_len, dtype=torch.long, device=flat_cache.device)
+        block_cols = torch.div(positions, metadata.block_size, rounding_mode="floor")
+        if int(block_cols.max().item()) >= int(block_row.numel()):
+            return None
+        offsets = positions.remainder(metadata.block_size)
+        slots = block_row[block_cols] * metadata.block_size + offsets
+        return flat_cache[slots]
+
+    @staticmethod
+    def _require_decode_cache_metadata(
+        *,
+        layer_cache: Any,
+        metadata: _DenseMlaMetadata,
+        kv_dim: int,
+    ) -> None:
+        missing = []
+        if metadata.block_table is None:
+            missing.append("block_table")
+        if metadata.seq_lens is None:
+            missing.append("seq_lens")
+        if metadata.slot_mapping is None:
+            missing.append("slot_mapping")
+        if missing:
+            raise ValueError(
+                "GLM5 RTP dense MLA decode requires RTP KV metadata: "
+                + ", ".join(missing)
+                + "."
+            )
+        flat_cache = RTPDenseMlaBackend._flatten_latent_cache(
+            layer_cache, block_size=metadata.block_size, kv_dim=kv_dim
+        )
+        if flat_cache is None:
+            raise ValueError(
+                "GLM5 RTP dense MLA decode requires a readable BF16/FP16 kv_cache_base."
+            )
+
+    @staticmethod
+    def _record_debug(
+        *,
+        layer_id: int,
+        is_prefill: bool,
+        query_seq_len: int,
+        key_seq_len: int,
+        q: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        if not _debug_enabled():
+            return
+        detached = output.detach()
+        _DEBUG_STATS.append(
+            {
+                "layer_id": int(layer_id),
+                "is_prefill": bool(is_prefill),
+                "query_seq_len": int(query_seq_len),
+                "key_seq_len": int(key_seq_len),
+                "q_shape": tuple(q.shape),
+                "output_shape": tuple(output.shape),
+                "output_all_zero": bool((detached == 0).all().item()) if detached.numel() else True,
+                "output_max_abs": float(detached.float().abs().max().item())
+                if detached.numel()
+                else 0.0,
+                "output_mean_abs": float(detached.float().abs().mean().item())
+                if detached.numel()
+                else 0.0,
+            }
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -126,13 +381,73 @@ class RTPDenseMlaBackend:
         layer_id: int,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        del kv_cache, layer_id, topk_indices
+        del topk_indices
         projected = self._project_kv(q, compressed_kv, k_pe)
         if projected is None:
             return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
-
+        metadata = self._get_metadata(q.shape[0], q.device)
+        kv_dim = int(compressed_kv.shape[-1]) + int(k_pe.shape[-1])
+        self._write_current_to_cache(
+            layer_cache=kv_cache,
+            compressed_kv=compressed_kv,
+            k_pe=k_pe,
+            metadata=metadata,
+            kv_dim=kv_dim,
+        )
         key, value = projected
-        query_start_loc = self._get_query_start_loc(q.shape[0], q.device)
+        query_start_loc = metadata.query_start_loc
         scale = float(q.shape[-1] ** -0.5)
-        output = self._causal_attention(q, key, value, query_start_loc, scale)
+        if metadata.is_prefill:
+            output = self._causal_attention(q, key, value, query_start_loc, scale)
+            for start_tensor, end_tensor in zip(query_start_loc[:-1], query_start_loc[1:]):
+                self._record_debug(
+                    layer_id=layer_id,
+                    is_prefill=True,
+                    query_seq_len=int(end_tensor.item() - start_tensor.item()),
+                    key_seq_len=int(end_tensor.item() - start_tensor.item()),
+                    q=q,
+                    output=output,
+                )
+            return output.to(dtype=compressed_kv.dtype)
+
+        self._require_decode_cache_metadata(
+            layer_cache=kv_cache,
+            metadata=metadata,
+            kv_dim=kv_dim,
+        )
+        pieces: list[torch.Tensor] = []
+        for batch_idx, (start_tensor, end_tensor) in enumerate(
+            zip(query_start_loc[:-1], query_start_loc[1:])
+        ):
+            start = int(start_tensor.item())
+            end = int(end_tensor.item())
+            if end <= start:
+                continue
+            q_seg = q[start:end]
+            latent_history = self._gather_latent_history(
+                layer_cache=kv_cache,
+                metadata=metadata,
+                batch_idx=batch_idx,
+                kv_dim=kv_dim,
+            )
+            if latent_history is None:
+                raise ValueError(
+                    "GLM5 RTP dense MLA decode failed to gather latent KV history."
+                )
+            hist_compressed_kv, hist_k_pe = latent_history.split(
+                [compressed_kv.shape[-1], k_pe.shape[-1]], dim=-1
+            )
+            hist_key, hist_value = self._project_kv(q_seg, hist_compressed_kv, hist_k_pe)
+            pieces.append(
+                self._cross_causal_attention(q_seg, hist_key, hist_value, scale)
+            )
+            self._record_debug(
+                layer_id=layer_id,
+                is_prefill=False,
+                query_seq_len=end - start,
+                key_seq_len=int(hist_key.shape[0]),
+                q=q_seg,
+                output=pieces[-1],
+            )
+        output = torch.cat(pieces, dim=0) if pieces else value.new_empty((0, *value.shape[1:]))
         return output.to(dtype=compressed_kv.dtype)
