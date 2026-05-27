@@ -7,14 +7,6 @@ from typing import Optional
 import torch
 
 
-class _ZeroAttentionBackend:
-    def __init__(self, v_head_dim: int) -> None:
-        self.v_head_dim = int(v_head_dim)
-
-    def forward(self, q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=None):
-        return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
-
-
 def _resolve_index_topk(attn) -> int:
     for obj, attr in (
         (getattr(attn, "indexer", None), "index_topk"),
@@ -92,12 +84,15 @@ class RTPMLAAttention:
         if injected_backend is not None:
             self.dense_backend = injected_backend
         elif mla_modules is not None:
+            from atom.plugin.rtpllm.attention_backend.rtp_dense_mla_backend import (
+                RTPDenseMlaBackend,
+            )
             from atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend import (
                 RTPSparseMlaBackend,
             )
 
             self.dense_backend = RTPSparseMlaBackend(
-                dense_backend=_ZeroAttentionBackend(mla_modules.v_head_dim),
+                dense_backend=RTPDenseMlaBackend(mla_modules=mla_modules),
                 v_head_dim=mla_modules.v_head_dim,
             )
         else:
