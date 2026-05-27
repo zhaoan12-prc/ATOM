@@ -58,9 +58,102 @@ class _ATOMRuntime(GptModelBase):
         self._model_dtype = first_param.dtype
         # Cache layer maps once to avoid per-forward model.modules() traversal.
         self._rtp_layer_maps = RTPForwardContext.collect_layer_maps(model=self.model)
+        # aiter's rope_cached_positions_2c_fwd_inplace (used by MLA RoPE in
+        # atom.models.deepseek_v2) is compiled with INT64 positions only and
+        # rejects int32 with "does not support positions dtype Int". Non-MLA
+        # paths (e.g. Qwen3.5-MoE) keep int32 — that's what v1 plugin uses.
+        use_mla = bool(getattr(getattr(model_config, "attn_config", None), "use_mla", False))
+        self._position_dtype = torch.int64 if use_mla else torch.int32
 
     def load_weights(self):
         # ATOM weights are loaded exactly once from ATOMRtpllmModelBase._create_python_model.
+        return None
+
+    def initialize(self, init_resource: Any) -> bool:
+        ok = super().initialize(init_resource)
+        self._wire_dsa_indexer_caches(init_resource)
+        return ok
+
+    def _wire_dsa_indexer_caches(self, init_resource: Any) -> None:
+        # DeepSeek-V3.2-style DSA models (e.g. GLM-5) create per-layer
+        # `DeepseekV32IndexerCache` modules whose `kv_cache[0]` is the
+        # indexer K cache buffer. In vLLM plugin mode this slot is filled by
+        # vLLM's static_forward_context wiring; rtp-llm has no equivalent, so
+        # we inject the per-layer scale buffer that SingleConfigCreator sized
+        # specifically for the indexer (kv_scale_stride_bytes =
+        # (indexer_dim + indexer_dim/128 * 4) * seq_size_per_block when
+        # attn_config.is_sparse is True). Without this the buffer stays
+        # empty and `kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])`
+        # in atom.models.deepseek_v2.sparse_attn_indexer fails with
+        # "cannot reshape tensor of 0 elements into shape [-1, 16, 0]".
+        kv_cache = getattr(init_resource, "kv_cache", None)
+        if kv_cache is None:
+            return
+        scale_by_layer = getattr(kv_cache, "kv_scale_base_by_layer", None)
+        if not scale_by_layer:
+            return
+
+        try:
+            from atom.models.deepseek_v2 import DeepseekV32IndexerCache
+        except ImportError:
+            return
+
+        wired = 0
+        for module in self.model.modules():
+            if not isinstance(module, DeepseekV32IndexerCache):
+                continue
+            layer_idx = self._parse_layer_idx_from_prefix(getattr(module, "prefix", ""))
+            if layer_idx is None or layer_idx >= len(scale_by_layer):
+                logger.warning(
+                    "Skipping indexer cache wiring: prefix=%r layer_idx=%s scale_layers=%d",
+                    getattr(module, "prefix", ""),
+                    layer_idx,
+                    len(scale_by_layer),
+                )
+                continue
+            raw = scale_by_layer[layer_idx]
+            if raw is None or raw.numel() == 0:
+                logger.warning(
+                    "Indexer scale buffer for layer %d is empty; sparse attention will fail.",
+                    layer_idx,
+                )
+                continue
+            head_dim = int(module.head_dim)
+            byte_view = raw.view(torch.uint8).contiguous().view(-1)
+            if int(byte_view.numel()) % head_dim != 0:
+                logger.warning(
+                    "Indexer scale buffer for layer %d not aligned to head_dim=%d (numel=%d).",
+                    layer_idx,
+                    head_dim,
+                    int(byte_view.numel()),
+                )
+                continue
+            shaped = byte_view.view(-1, head_dim)
+            module.kv_cache = [shaped]
+            wired += 1
+
+        logger.info("Wired DeepseekV32IndexerCache buffers for %d layers.", wired)
+
+    @staticmethod
+    def _parse_layer_idx_from_prefix(prefix: str) -> int | None:
+        # Expected prefix: "model.layers.{idx}.self_attn.indexer.k_cache".
+        if not prefix:
+            return None
+        parts = prefix.split(".")
+        for i, part in enumerate(parts):
+            if part == "layers" and i + 1 < len(parts):
+                try:
+                    return int(parts[i + 1])
+                except ValueError:
+                    return None
+        return None
+
+    def prepare_fmha_impl(self, inputs: PyModelInputs, is_cuda_graph: bool = False) -> Any:
+        # ATOM models drive attention through RTPAttention via RTPForwardContext;
+        # rtp-llm's AttnImplFactory is bypassed entirely. ROCm has no MLA impls
+        # registered in PREFILL_MLA_IMPS/DECODE_MLA_IMPS, so the default
+        # GptModelBase.prepare_fmha_impl would raise "can not find mla type"
+        # for sparse-MLA models like GLM-5. forward() ignores fmha_impl anyway.
         return None
 
     def _get_model_device(self) -> torch.device:
@@ -135,9 +228,8 @@ class _ATOMRuntime(GptModelBase):
         )
         return (token_starts + token_ordinal).to(dtype=torch.int32).contiguous()
 
-    @staticmethod
     def _extract_combo_positions(
-        inputs: PyModelInputs, model_device: torch.device
+        self, inputs: PyModelInputs, model_device: torch.device
     ) -> torch.Tensor | None:
         bert_inputs = getattr(inputs, "bert_embedding_inputs", None)
         if bert_inputs is None:
@@ -146,7 +238,7 @@ class _ATOMRuntime(GptModelBase):
         if combo_position_ids is None or combo_position_ids.numel() == 0:
             return None
         return combo_position_ids.to(
-            device=model_device, dtype=torch.int32, non_blocking=True
+            device=model_device, dtype=self._position_dtype, non_blocking=True
         ).contiguous()
 
     def _extract_positions(
@@ -170,7 +262,7 @@ class _ATOMRuntime(GptModelBase):
                 "(position_ids or input/prefix/sequence lengths)."
             )
         positions = positions.to(
-            device=model_device, dtype=torch.int32, non_blocking=True
+            device=model_device, dtype=self._position_dtype, non_blocking=True
         ).contiguous()
         pos_tokens = (
             int(positions.shape[-1]) if positions.dim() > 0 else int(positions.numel())
@@ -186,7 +278,7 @@ class _ATOMRuntime(GptModelBase):
             )
             if rebuilt is not None and rebuilt_tokens == token_num:
                 positions = rebuilt.to(
-                    device=model_device, dtype=torch.int32, non_blocking=True
+                    device=model_device, dtype=self._position_dtype, non_blocking=True
                 ).contiguous()
             elif pos_tokens > token_num:
                 positions = positions[..., -token_num:].contiguous()

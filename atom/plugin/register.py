@@ -39,6 +39,15 @@ if is_sglang():
         }
     )
 
+if is_rtpllm():
+    from atom.models.deepseek_v2 import GlmMoeDsaForCausalLM
+
+    _ATOM_SUPPORTED_MODELS.update(
+        {
+            "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
+        }
+    )
+
 
 def _register_custom_attention_to_sglang() -> None:
     """Override sglang's built-in "aiter" attention backend with ATOM's implementation.

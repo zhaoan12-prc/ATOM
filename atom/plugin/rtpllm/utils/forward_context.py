@@ -720,19 +720,22 @@ class RTPForwardContext:
     def collect_layer_maps(model: Any) -> LayerMaps:
         gdn_layer_map: Dict[int, GatedDeltaNet] = {}
         full_attn_layer_map: Dict[int, Any] = {}
-        rtp_attention_cls: type[Any] | None = None
+        rtp_attention_classes: tuple[type[Any], ...] = ()
         try:
-            from atom.plugin.rtpllm.attention_backend import RTPAttention
+            from atom.plugin.rtpllm.attention_backend import (
+                RTPFullAttention,
+                RTPMlaAttention,
+            )
 
-            rtp_attention_cls = RTPAttention
+            rtp_attention_classes = (RTPFullAttention, RTPMlaAttention)
         except (ImportError, ModuleNotFoundError):
-            rtp_attention_cls = None
+            rtp_attention_classes = ()
 
         for module in model.modules():
             if isinstance(module, GatedDeltaNet):
                 gdn_layer_map[int(module.layer_num)] = module
             elif isinstance(module, PagedAttention) or (
-                rtp_attention_cls is not None and isinstance(module, rtp_attention_cls)
+                rtp_attention_classes and isinstance(module, rtp_attention_classes)
             ):
                 impl = getattr(module, "impl", None)
                 layer_num = getattr(impl, "layer_num", None)
