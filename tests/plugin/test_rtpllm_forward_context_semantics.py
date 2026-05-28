@@ -162,6 +162,47 @@ def test_plugin_attention_metadata_slot_mapping_uses_physical_block_table():
     assert md.plugin_metadata.slot_mapping.cpu().tolist() == [8 * 1024 + 5]
 
 
+def test_plugin_attention_metadata_builds_req_id_per_token():
+    attn_inputs = _make_attn_inputs(
+        input_lengths=torch.tensor([2, 1], dtype=torch.int32),
+        prefix_lengths=torch.tensor([0, 0], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 2, 3], dtype=torch.int32),
+        kv_cache_block_id_device=torch.tensor([[3], [4]], dtype=torch.int32),
+        kv_cache_kernel_block_id_device=torch.tensor([[30], [40]], dtype=torch.int32),
+        is_prefill=True,
+    )
+
+    md = RTPForwardContext._build_plugin_attention_metadata(
+        attn_inputs=attn_inputs,
+        positions=torch.tensor([0, 1, 0], dtype=torch.int32),
+        seq_size_per_block=1024,
+    )
+
+    assert md.plugin_metadata.req_id_per_token.cpu().tolist() == [0, 0, 1]
+    assert md.plugin_metadata.sparse_block_size == 1024
+    assert md.cu_seqlens_q.cpu().tolist() == [0, 2, 3]
+    assert md.cu_seqlens_k.cpu().tolist() == [0, 2, 3]
+    assert md.cu_seqlen_ks.cpu().tolist() == [0, 0, 2]
+    assert md.cu_seqlen_ke.cpu().tolist() == [1, 2, 3]
+    assert md.total_kv == 3
+
+
+def test_rtp_indexer_cache_accepts_byte_packed_kv_scale_base():
+    kv_scale_base = torch.empty((2, 1024, 132), dtype=torch.uint8)
+    layer_cache = SimpleNamespace(kv_scale_base=kv_scale_base)
+    indexer = SimpleNamespace(head_dim=128)
+
+    cache = RTPForwardContext._resolve_rtp_indexer_cache(
+        layer_num=0,
+        layer_cache=layer_cache,
+        indexer=indexer,
+        block_size=1024,
+    )
+
+    assert tuple(cache.shape) == (2, 1024, 132)
+    assert cache.dtype == dtypes.fp8
+
+
 def test_rtpllm_decode_seq_lens_priority_splits_graph_and_eager_modes():
     input_lengths = torch.tensor([1], dtype=torch.int32)
     sequence_lengths = torch.tensor([35], dtype=torch.int32)

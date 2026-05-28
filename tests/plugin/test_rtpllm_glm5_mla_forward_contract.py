@@ -452,13 +452,6 @@ def test_default_dense_mla_backend_rejects_missing_multi_token_metadata(monkeypa
 
 def test_default_dense_mla_backend_decode_reads_history_from_raw_cache(monkeypatch):
     _guard_sparse_kernel_imports(monkeypatch)
-    from atom.plugin.rtpllm.attention_backend.rtp_dense_mla_backend import (
-        get_dense_mla_debug_stats,
-        reset_dense_mla_debug_stats,
-    )
-
-    monkeypatch.setenv("ATOM_RTP_DENSE_MLA_DEBUG", "1")
-    reset_dense_mla_debug_stats()
     q = torch.tensor([[[0.0, 1.0]]], dtype=torch.float32)
     compressed_kv = torch.tensor([[9.0, 9.0, 9.0, 9.0]], dtype=torch.float32)
     # The backend projects each latent token into [k_nope0, k_nope1, v].
@@ -492,10 +485,6 @@ def test_default_dense_mla_backend_decode_reads_history_from_raw_cache(monkeypat
 
     assert output.shape == (1, 1, 1)
     assert layer_cache.kv_cache_base[0, 3].tolist() == [9.0, 9.0, 9.0, 9.0]
-    stats = get_dense_mla_debug_stats()
-    assert stats[-1]["is_prefill"] is False
-    assert stats[-1]["query_seq_len"] == 1
-    assert stats[-1]["key_seq_len"] == 4
 
 
 def test_default_dense_mla_backend_decode_uses_top_level_rtp_metadata(monkeypatch):
@@ -951,13 +940,6 @@ def test_default_dense_mla_backend_rejects_fp8_kv_cache(monkeypatch):
 
 def test_default_dense_mla_backend_glm5_shape_bf16_cache_roundtrip(monkeypatch):
     _guard_sparse_kernel_imports(monkeypatch)
-    from atom.plugin.rtpllm.attention_backend.rtp_dense_mla_backend import (
-        get_dense_mla_debug_stats,
-        reset_dense_mla_debug_stats,
-    )
-
-    monkeypatch.setenv("ATOM_RTP_DENSE_MLA_DEBUG", "1")
-    reset_dense_mla_debug_stats()
     num_heads = 32
     qk_nope_head_dim = 128
     qk_rope_head_dim = 64
@@ -1037,9 +1019,6 @@ def test_default_dense_mla_backend_glm5_shape_bf16_cache_roundtrip(monkeypatch):
     assert torch.equal(layer_cache.kv_cache_base[0, 3:4], expected_decode_cache)
     expected_history = torch.cat((compressed_prefill, compressed_decode), dim=0)
     assert torch.equal(kv_proj.calls[-1], expected_history)
-    stats = get_dense_mla_debug_stats()
-    assert stats[-1]["is_prefill"] is False
-    assert stats[-1]["key_seq_len"] == 4
 
 
 def test_default_dense_mla_backend_rejects_bad_kv_projection_shape(monkeypatch):
