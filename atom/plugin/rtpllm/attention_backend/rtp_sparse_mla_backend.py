@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -24,6 +25,7 @@ class _ContractSparseMlaImpl:
         *,
         topk_indices: torch.Tensor,
         attn_metadata: object,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self.calls.append(
             {
@@ -34,6 +36,7 @@ class _ContractSparseMlaImpl:
                 "layer_id": layer_id,
                 "topk_indices": topk_indices,
                 "attn_metadata": attn_metadata,
+                "positions": positions,
             }
         )
         return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
@@ -87,6 +90,15 @@ class RTPSparseMlaBackend:
                 f"got {topk_indices.shape[0]} and {q.shape[0]}"
             )
 
+    @staticmethod
+    def _enable_sparse_mock() -> bool:
+        return os.getenv("ATOM_RTP_ENABLE_SPARSE_MLA_MOCK", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
     def forward(
         self,
         q: torch.Tensor,
@@ -95,6 +107,7 @@ class RTPSparseMlaBackend:
         kv_cache: object,
         layer_id: int,
         topk_indices: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if topk_indices is None:
             return self.dense_backend.forward(
@@ -104,9 +117,21 @@ class RTPSparseMlaBackend:
                 kv_cache,
                 layer_id,
                 topk_indices=None,
+                positions=positions,
             )
 
         self._validate_topk_indices(q, topk_indices)
+        if not self._enable_sparse_mock():
+            return self.dense_backend.forward(
+                q,
+                compressed_kv,
+                k_pe,
+                kv_cache,
+                layer_id,
+                topk_indices=topk_indices,
+                positions=positions,
+            )
+
         return self.sparse_impl.forward(
             q,
             compressed_kv,
@@ -115,4 +140,5 @@ class RTPSparseMlaBackend:
             layer_id,
             topk_indices=topk_indices,
             attn_metadata=self._get_attn_metadata(),
+            positions=positions,
         )
