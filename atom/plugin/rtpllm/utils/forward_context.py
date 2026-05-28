@@ -278,6 +278,22 @@ class RTPForwardContext:
         return getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
 
     @staticmethod
+    def _select_physical_block_table_for_layer(
+        attn_inputs: Any,
+        group_id: int | None = None,
+    ) -> torch.Tensor | None:
+        # MLA cache writes use concat_and_cache_mla(slot_mapping), whose slot is
+        # indexed in the physical KV cache layout, not the smaller kernel block
+        # granularity used by some RTP attention kernels.
+        block_table = getattr(attn_inputs, "kv_cache_block_id_device", None)
+        if block_table is not None:
+            return block_table
+        return RTPForwardContext._select_block_table_for_layer(
+            attn_inputs=attn_inputs,
+            group_id=group_id,
+        )
+
+    @staticmethod
     def _build_layer_group_map(attn_inputs: Any) -> Dict[int, int]:
         layer_to_group = getattr(attn_inputs, "kv_cache_layer_to_group", None)
         if layer_to_group is None or int(layer_to_group.numel()) == 0:
@@ -691,6 +707,21 @@ class RTPForwardContext:
             )
         token_offset = torch.remainder(pos_i32, int(seq_size_per_block))
         slot_mapping = slot_base * int(seq_size_per_block) + token_offset
+        if validate_slot_mapping:
+            max_physical_slot = (bt.to(dtype=torch.int64).max() + 1) * int(
+                seq_size_per_block
+            )
+            invalid = (slot_mapping < 0) | (
+                slot_mapping.to(dtype=torch.int64) >= max_physical_slot
+            )
+            if bool(invalid.any().item()):
+                bad_slots = slot_mapping[invalid].to(dtype=torch.int64)
+                raise ValueError(
+                    "RTP plugin built invalid slot_mapping "
+                    f"(slot_min={int(bad_slots.min().item())}, "
+                    f"slot_max={int(bad_slots.max().item())}, "
+                    f"max_physical_slot={int(max_physical_slot.item())})."
+                )
         return slot_mapping.to(dtype=torch.int64).contiguous()
 
     @staticmethod
@@ -771,12 +802,12 @@ class RTPForwardContext:
         cg_max_seq_len: int = 0,
         cg_bufs: dict | None = None,
     ) -> AttentionMetaData:
-        block_table = RTPForwardContext._select_block_table_for_layer(
+        block_table = RTPForwardContext._select_physical_block_table_for_layer(
             attn_inputs=attn_inputs,
         )
         if block_table is None or block_table.numel() == 0:
             raise ValueError(
-                "RTP plugin requires kv_cache_kernel_block_id_device for plugin attention metadata."
+                "RTP plugin requires kv_cache_block_id_device for plugin attention metadata."
             )
         device = positions.device
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
@@ -1226,7 +1257,7 @@ class RTPForwardContext:
         attn_metadata = cls._build_plugin_attention_metadata(
             attn_inputs=attn_inputs,
             positions=positions,
-            seq_size_per_block=kernel_seq_size_per_block,
+            seq_size_per_block=seq_size_per_block,
             cg_max_seq_len=int(cg_max_seq_len),
             cg_bufs=cg_bufs,
         )
@@ -1389,7 +1420,8 @@ class RTPForwardContext:
             if kv_cache_base is None or kv_cache_base.dim() == 0:
                 continue
             block_size = int(
-                forward_context.rtp_kernel_seq_size_per_block
+                getattr(forward_context, "rtp_seq_size_per_block", 0)
+                or getattr(forward_context, "rtp_kernel_seq_size_per_block", 0)
                 or getattr(get_current_atom_config(), "kv_cache_block_size", 0)
                 or 1
             )
@@ -1441,6 +1473,9 @@ class RTPForwardContext:
         attn_md.rtp_attn_inputs = forward_context.rtp_attn_inputs
         attn_md.rtp_kernel_seq_size_per_block = (
             forward_context.rtp_kernel_seq_size_per_block
+        )
+        attn_md.rtp_seq_size_per_block = getattr(
+            forward_context, "rtp_seq_size_per_block", 0
         )
         attn_md.rtp_layer_group_map = forward_context.layer_group_map
         restore_mla_attrs: list[tuple[Any, str, Any]] = []

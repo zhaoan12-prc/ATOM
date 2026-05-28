@@ -39,6 +39,10 @@ def _debug_enabled() -> bool:
     }
 
 
+def _raise_cache_error(message: str) -> None:
+    raise RuntimeError(message)
+
+
 @dataclass(frozen=True)
 class _DenseMlaMetadata:
     query_start_loc: torch.Tensor
@@ -78,28 +82,54 @@ class RTPDenseMlaBackend:
     def _get_metadata(num_tokens: int, device: torch.device) -> _DenseMlaMetadata:
         attn_metadata = None
         context = None
-        rtp_kernel_seq_size_per_block = 1
+        rtp_seq_size_per_block = 1
         try:
             from atom.utils.forward_context import get_forward_context
 
             forward_context = get_forward_context()
             attn_metadata = getattr(forward_context, "attn_metadata", None)
             context = getattr(forward_context, "context", None)
-            rtp_kernel_seq_size_per_block = int(
-                getattr(attn_metadata, "rtp_kernel_seq_size_per_block", 0) or 0
+            rtp_seq_size_per_block = int(
+                getattr(attn_metadata, "rtp_seq_size_per_block", 0)
+                or getattr(attn_metadata, "rtp_kernel_seq_size_per_block", 0)
+                or 0
             )
             plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
             query_start_loc = getattr(plugin_metadata, "query_start_loc", None)
             if query_start_loc is None:
                 query_start_loc = getattr(plugin_metadata, "rtp_cu_seqlens_q", None)
+            if query_start_loc is None:
+                query_start_loc = getattr(attn_metadata, "cu_seqlens_q", None)
+            if query_start_loc is None:
+                decode_metadata = getattr(plugin_metadata, "decode_metadata", None)
+                query_start_loc = getattr(decode_metadata, "query_start_loc", None)
             seq_lens = getattr(plugin_metadata, "seq_lens", None)
+            if seq_lens is None:
+                seq_lens = getattr(attn_metadata, "context_lens", None)
             block_table = getattr(plugin_metadata, "block_table", None)
+            if block_table is None:
+                block_table = getattr(attn_metadata, "block_tables", None)
             slot_mapping = getattr(plugin_metadata, "slot_mapping", None)
+            if slot_mapping is None:
+                slot_mapping = getattr(attn_metadata, "slot_mapping", None)
         except Exception:
             query_start_loc = None
             seq_lens = None
             block_table = None
             slot_mapping = None
+
+        if (
+            context is not None
+            and hasattr(context, "is_prefill")
+            and not bool(getattr(context, "is_prefill"))
+            and isinstance(seq_lens, torch.Tensor)
+            and int(seq_lens.numel()) == num_tokens
+            and isinstance(block_table, torch.Tensor)
+            and isinstance(slot_mapping, torch.Tensor)
+        ):
+            query_start_loc = torch.arange(
+                num_tokens + 1, dtype=torch.int64, device=device
+            )
 
         if query_start_loc is not None and int(query_start_loc.numel()) >= 2:
             query_start_loc = query_start_loc.to(device=device, dtype=torch.int64)
@@ -123,7 +153,7 @@ class RTPDenseMlaBackend:
                         else None
                     ),
                     is_prefill=is_prefill,
-                    block_size=max(1, rtp_kernel_seq_size_per_block),
+                    block_size=max(1, rtp_seq_size_per_block),
                 )
         if num_tokens != 1:
             raise ValueError(
@@ -137,7 +167,7 @@ class RTPDenseMlaBackend:
             block_table=None,
             slot_mapping=None,
             is_prefill=is_prefill,
-            block_size=max(1, rtp_kernel_seq_size_per_block),
+            block_size=max(1, rtp_seq_size_per_block),
         )
 
     @staticmethod
@@ -320,10 +350,20 @@ class RTPDenseMlaBackend:
         if latent.shape[0] != metadata.slot_mapping.shape[0]:
             return
         slots = metadata.slot_mapping[: latent.shape[0]].long()
-        valid = slots >= 0
-        if not bool(valid.any().item()):
+        flat_size = int(flat_cache.shape[0])
+        non_negative = slots >= 0
+        in_bounds = non_negative & (slots < flat_size)
+        if bool((non_negative & (slots >= flat_size)).any().item()):
+            bad_slots = slots[non_negative & (slots >= flat_size)]
+            _raise_cache_error(
+                "GLM5 RTP dense MLA refuses to write out-of-bounds slot_mapping "
+                f"(block_size={metadata.block_size}, flat_tokens={flat_size}, "
+                f"slot_min={int(bad_slots.min().item())}, "
+                f"slot_max={int(bad_slots.max().item())})."
+            )
+        if not bool(in_bounds.any().item()):
             return
-        flat_cache[slots[valid]] = latent[valid].to(dtype=flat_cache.dtype)
+        flat_cache[slots[in_bounds]] = latent[in_bounds].to(dtype=flat_cache.dtype)
 
     @staticmethod
     def _resolve_layer_cache(kv_cache: object, layer_id: int) -> object:
@@ -364,10 +404,21 @@ class RTPDenseMlaBackend:
         block_row = metadata.block_table[batch_idx].long()
         positions = torch.arange(seq_len, dtype=torch.long, device=flat_cache.device)
         block_cols = torch.div(positions, metadata.block_size, rounding_mode="floor")
-        if int(block_cols.max().item()) >= int(block_row.numel()):
+        block_col_max = int(block_cols.max().item())
+        if block_col_max >= int(block_row.numel()):
             return None
         offsets = positions.remainder(metadata.block_size)
         slots = block_row[block_cols] * metadata.block_size + offsets
+        flat_size = int(flat_cache.shape[0])
+        if bool(((slots < 0) | (slots >= flat_size)).any().item()):
+            bad_slots = slots[(slots < 0) | (slots >= flat_size)]
+            _raise_cache_error(
+                "GLM5 RTP dense MLA refuses to gather out-of-bounds KV history "
+                f"(batch_idx={batch_idx}, seq_len={seq_len}, "
+                f"block_size={metadata.block_size}, flat_tokens={flat_size}, "
+                f"slot_min={int(bad_slots.min().item())}, "
+                f"slot_max={int(bad_slots.max().item())})."
+            )
         return flat_cache[slots]
 
     @staticmethod
