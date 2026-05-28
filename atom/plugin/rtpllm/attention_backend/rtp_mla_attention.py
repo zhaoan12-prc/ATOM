@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Optional
 
 import torch
@@ -100,6 +101,17 @@ class RTPMLAAttention:
         self.kv_cache = kwargs.get("kv_cache")
         self.layer_id = int(kwargs.get("layer_id", kwargs.get("layer_num", 0)))
 
+    @staticmethod
+    def _backend_accepts_positions(backend: object) -> bool:
+        try:
+            signature = inspect.signature(backend.forward)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return "positions" in signature.parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+
     def _project_query(
         self, query: torch.Tensor, q_scale: Optional[torch.Tensor]
     ) -> tuple[torch.Tensor, bool]:
@@ -159,13 +171,16 @@ class RTPMLAAttention:
             positions,
             kwargs.get("topk_indices", topk_indices),
         )
+        forward_kwargs = {"topk_indices": topk_indices}
+        if self._backend_accepts_positions(self.dense_backend):
+            forward_kwargs["positions"] = positions
         attn_output = self.dense_backend.forward(
             q,
             compressed_kv,
             k_pe,
             self.kv_cache,
             self.layer_id,
-            topk_indices=topk_indices,
+            **forward_kwargs,
         )
         if native_projected and self.o_proj is not None:
             attn_output = attn_output.reshape(attn_output.shape[0], -1).contiguous()

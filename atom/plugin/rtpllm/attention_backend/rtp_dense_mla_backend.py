@@ -60,6 +60,7 @@ class RTPDenseMlaBackend:
     def __init__(self, *, mla_modules: Any) -> None:
         self.mla_modules = mla_modules
         self.kv_b_proj = getattr(mla_modules, "kv_b_proj", None)
+        self.rotary_emb = getattr(mla_modules, "rotary_emb", None)
         self.v_head_dim = int(getattr(mla_modules, "v_head_dim"))
         self.qk_nope_head_dim = getattr(mla_modules, "qk_nope_head_dim", None)
         self.qk_rope_head_dim = getattr(mla_modules, "qk_rope_head_dim", None)
@@ -147,6 +148,41 @@ class RTPDenseMlaBackend:
             raise TypeError(f"Expected kv_b_proj to return Tensor, got {type(value)!r}.")
         return value
 
+    def _apply_current_rope(
+        self,
+        q: torch.Tensor,
+        k_pe: torch.Tensor,
+        positions: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rope_dim = int(self.qk_rope_head_dim or k_pe.shape[-1])
+        if rope_dim == 0:
+            return q, k_pe
+        if self.rotary_emb is None:
+            raise ValueError("GLM5 RTP dense MLA requires rotary_emb for RoPE dimensions.")
+        if positions is None or int(positions.numel()) != int(q.shape[0]):
+            got = None if positions is None else int(positions.numel())
+            raise ValueError(
+                "GLM5 RTP dense MLA requires per-token absolute positions for RoPE "
+                f"(positions={got}, tokens={int(q.shape[0])})."
+            )
+        if int(q.shape[-1]) < rope_dim:
+            raise ValueError(
+                f"GLM5 RTP dense MLA invalid q shape for RoPE: q={tuple(q.shape)}, "
+                f"rope_dim={rope_dim}."
+            )
+
+        q_rope = q.clone()
+        k_pe_rope = k_pe.clone()
+        # RotaryEmbedding.forward rotates the full tensor it receives. Passing
+        # only q_pe/k_pe is equivalent to the fused MLA path's nope-first layout.
+        rotated_q_pe, rotated_k_pe = self.rotary_emb(
+            positions.to(device=q.device, dtype=torch.long),
+            q_rope[..., -rope_dim:],
+            k_pe_rope,
+        )
+        q_rope[..., -rope_dim:] = rotated_q_pe
+        return q_rope, rotated_k_pe
+
     def _project_kv(
         self,
         q: torch.Tensor,
@@ -164,6 +200,7 @@ class RTPDenseMlaBackend:
                 f"Invalid MLA qk dims: qk_head_dim={qk_head_dim}, rope_dim={rope_dim}."
             )
 
+        compressed_kv = compressed_kv.contiguous()
         kv_nope = self._unwrap_linear_output(self.kv_b_proj(compressed_kv))
         if kv_nope.numel() == 0:
             raise ValueError("GLM5 RTP dense MLA kv_b_proj returned an empty tensor.")
@@ -282,9 +319,29 @@ class RTPDenseMlaBackend:
         latent = torch.cat((compressed_kv, k_pe), dim=-1)
         if latent.shape[0] != metadata.slot_mapping.shape[0]:
             return
-        flat_cache[metadata.slot_mapping[: latent.shape[0]].long()] = latent.to(
-            dtype=flat_cache.dtype
-        )
+        slots = metadata.slot_mapping[: latent.shape[0]].long()
+        valid = slots >= 0
+        if not bool(valid.any().item()):
+            return
+        flat_cache[slots[valid]] = latent[valid].to(dtype=flat_cache.dtype)
+
+    @staticmethod
+    def _resolve_layer_cache(kv_cache: object, layer_id: int) -> object:
+        if kv_cache is not None:
+            return kv_cache
+        try:
+            from atom.utils.forward_context import get_forward_context
+
+            forward_context = get_forward_context()
+            kv_cache_data = getattr(forward_context, "kv_cache_data", None)
+            if kv_cache_data is None:
+                return None
+            layer_cache_entry = kv_cache_data.get(f"layer_{int(layer_id)}")
+            if layer_cache_entry is None:
+                return None
+            return getattr(layer_cache_entry, "k_cache", layer_cache_entry)
+        except Exception:
+            return None
 
     @staticmethod
     def _gather_latent_history(
@@ -380,15 +437,20 @@ class RTPDenseMlaBackend:
         kv_cache: object,
         layer_id: int,
         topk_indices: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del topk_indices
+        if self.kv_b_proj is None:
+            return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
+        layer_cache = self._resolve_layer_cache(kv_cache, layer_id)
+        q, k_pe = self._apply_current_rope(q, k_pe, positions)
         projected = self._project_kv(q, compressed_kv, k_pe)
         if projected is None:
             return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
         metadata = self._get_metadata(q.shape[0], q.device)
         kv_dim = int(compressed_kv.shape[-1]) + int(k_pe.shape[-1])
         self._write_current_to_cache(
-            layer_cache=kv_cache,
+            layer_cache=layer_cache,
             compressed_kv=compressed_kv,
             k_pe=k_pe,
             metadata=metadata,
@@ -411,7 +473,7 @@ class RTPDenseMlaBackend:
             return output.to(dtype=compressed_kv.dtype)
 
         self._require_decode_cache_metadata(
-            layer_cache=kv_cache,
+            layer_cache=layer_cache,
             metadata=metadata,
             kv_dim=kv_dim,
         )
@@ -425,7 +487,7 @@ class RTPDenseMlaBackend:
                 continue
             q_seg = q[start:end]
             latent_history = self._gather_latent_history(
-                layer_cache=kv_cache,
+                layer_cache=layer_cache,
                 metadata=metadata,
                 batch_idx=batch_idx,
                 kv_dim=kv_dim,
