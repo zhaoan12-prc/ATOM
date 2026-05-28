@@ -66,6 +66,7 @@ def _make_attn_inputs(
     sequence_lengths=None,
     sequence_lengths_plus_1_d=None,
     cu_seqlens=None,
+    kv_cache_block_id_device=None,
     kv_cache_kernel_block_id_device=None,
     is_prefill=False,
     is_cuda_graph=False,
@@ -76,6 +77,7 @@ def _make_attn_inputs(
         sequence_lengths=sequence_lengths,
         sequence_lengths_plus_1_d=sequence_lengths_plus_1_d,
         cu_seqlens=cu_seqlens,
+        kv_cache_block_id_device=kv_cache_block_id_device,
         kv_cache_kernel_block_id_device=kv_cache_kernel_block_id_device,
         is_prefill=is_prefill,
         is_cuda_graph=is_cuda_graph,
@@ -137,6 +139,27 @@ def test_rtpllm_forward_context_decode_metadata_state_indices_shape():
     assert int(md.non_spec_state_indices_tensor.min().item()) >= 0
     # last token idx = 35 -> block col 2 under seq_size_per_block=16.
     assert md.non_spec_state_indices_tensor.cpu().tolist() == [125]
+
+
+def test_plugin_attention_metadata_slot_mapping_uses_physical_block_table():
+    attn_inputs = _make_attn_inputs(
+        input_lengths=torch.tensor([1], dtype=torch.int32),
+        sequence_lengths=torch.tensor([1030], dtype=torch.int32),
+        kv_cache_block_id_device=torch.tensor([[7, 8]], dtype=torch.int32),
+        kv_cache_kernel_block_id_device=torch.tensor(
+            [[700, 701, 702]], dtype=torch.int32
+        ),
+        is_prefill=False,
+    )
+
+    md = RTPForwardContext._build_plugin_attention_metadata(
+        attn_inputs=attn_inputs,
+        positions=torch.tensor([1029], dtype=torch.int32),
+        seq_size_per_block=1024,
+    )
+
+    assert md.plugin_metadata.block_table.cpu().tolist() == [[7, 8]]
+    assert md.plugin_metadata.slot_mapping.cpu().tolist() == [8 * 1024 + 5]
 
 
 def test_rtpllm_decode_seq_lens_priority_splits_graph_and_eager_modes():

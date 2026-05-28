@@ -350,6 +350,35 @@ def _patch_forward_context(
     )
 
 
+def _patch_forward_context_with_top_level_attn_metadata(
+    monkeypatch,
+    *,
+    is_prefill,
+    seq_lens,
+    block_table,
+    slot_mapping,
+    kv_cache_data=None,
+):
+    fake_context = SimpleNamespace(
+        attn_metadata=SimpleNamespace(
+            plugin_metadata=None,
+            context_lens=seq_lens,
+            block_tables=block_table,
+            slot_mapping=slot_mapping,
+            cu_seqlens_q=None,
+            rtp_kernel_seq_size_per_block=4,
+        ),
+        context=SimpleNamespace(is_prefill=is_prefill),
+        kv_cache_data=kv_cache_data,
+    )
+    forward_context_module = importlib.import_module("atom.utils.forward_context")
+    monkeypatch.setattr(
+        forward_context_module,
+        "get_forward_context",
+        lambda: fake_context,
+    )
+
+
 def _patch_forward_context_without_is_prefill(monkeypatch, *, query_start_loc):
     plugin_metadata = SimpleNamespace(
         query_start_loc=query_start_loc,
@@ -469,6 +498,69 @@ def test_default_dense_mla_backend_decode_reads_history_from_raw_cache(monkeypat
     assert stats[-1]["key_seq_len"] == 4
 
 
+def test_default_dense_mla_backend_decode_uses_top_level_rtp_metadata(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    q = torch.tensor([[[0.0, 1.0]]], dtype=torch.float32)
+    compressed_kv = torch.tensor([[9.0, 9.0, 9.0, 9.0]], dtype=torch.float32)
+    modules = SimpleNamespace(
+        v_head_dim=1,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=0,
+        kv_b_proj=_FakeKVProj(torch.tensor([[0.0, 0.0, 1.0]])),
+    )
+    layer_cache = SimpleNamespace(kv_cache_base=torch.zeros(1, 4, 4))
+    layer_cache.kv_cache_base[0, 0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    _patch_forward_context_with_top_level_attn_metadata(
+        monkeypatch,
+        is_prefill=False,
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        slot_mapping=torch.tensor([1], dtype=torch.int32),
+    )
+    attention = RTPMLAAttention(
+        mla_modules=modules,
+        layer_num=3,
+        kv_cache=layer_cache,
+    )
+
+    output = attention(q, compressed_kv, q.new_empty((1, 0)), positions=torch.arange(1))
+
+    assert output.shape == (1, 1, 1)
+    assert layer_cache.kv_cache_base[0, 1].tolist() == [9.0, 9.0, 9.0, 9.0]
+
+
+def test_default_dense_mla_backend_decode_rebuilds_stale_query_start_loc(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    q = torch.tensor([[[0.0, 1.0]]], dtype=torch.float32)
+    compressed_kv = torch.tensor([[9.0, 9.0, 9.0, 9.0]], dtype=torch.float32)
+    modules = SimpleNamespace(
+        v_head_dim=1,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=0,
+        kv_b_proj=_FakeKVProj(torch.tensor([[0.0, 0.0, 1.0]])),
+    )
+    layer_cache = SimpleNamespace(kv_cache_base=torch.zeros(1, 4, 4))
+    layer_cache.kv_cache_base[0, 0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    _patch_forward_context(
+        monkeypatch,
+        is_prefill=False,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        slot_mapping=torch.tensor([1], dtype=torch.int32),
+    )
+    attention = RTPMLAAttention(
+        mla_modules=modules,
+        layer_num=3,
+        kv_cache=layer_cache,
+    )
+
+    output = attention(q, compressed_kv, q.new_empty((1, 0)), positions=torch.arange(1))
+
+    assert output.shape == (1, 1, 1)
+    assert layer_cache.kv_cache_base[0, 1].tolist() == [9.0, 9.0, 9.0, 9.0]
+
+
 def test_default_sparse_wrapper_validates_topk_but_falls_back_to_dense(monkeypatch):
     _guard_sparse_kernel_imports(monkeypatch)
     from atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend import (
@@ -584,6 +676,31 @@ def test_default_dense_mla_backend_skips_negative_slot_mapping(monkeypatch):
 
     assert torch.equal(layer_cache.kv_cache_base[0, -1], torch.zeros(4))
     assert torch.equal(layer_cache.kv_cache_base[0, 1], compressed_kv[1])
+
+
+def test_default_dense_mla_backend_rejects_oob_slot_mapping(monkeypatch):
+    _guard_sparse_kernel_imports(monkeypatch)
+    q = torch.tensor([[[1.0, 0.0]]], dtype=torch.float32)
+    compressed_kv = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.float32)
+    modules = SimpleNamespace(
+        v_head_dim=1,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=0,
+        kv_b_proj=_FakeKVProj(torch.tensor([[1.0, 0.0, 1.0]])),
+    )
+    layer_cache = SimpleNamespace(kv_cache_base=torch.zeros(1, 4, 4))
+    _patch_forward_context(
+        monkeypatch,
+        is_prefill=True,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        slot_mapping=torch.tensor([4], dtype=torch.int32),
+    )
+    attention = RTPMLAAttention(mla_modules=modules, layer_num=3, kv_cache=layer_cache)
+
+    with pytest.raises(RuntimeError, match="out-of-bounds slot_mapping"):
+        attention(q, compressed_kv, q.new_empty((1, 0)), positions=torch.arange(1))
+
+    assert torch.equal(layer_cache.kv_cache_base, torch.zeros_like(layer_cache.kv_cache_base))
 
 
 def test_default_dense_mla_backend_writes_post_rope_kpe_to_cache(monkeypatch):
