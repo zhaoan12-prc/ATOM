@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import os
-from collections import deque
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 
 
-_DEBUG_STATS: deque[dict[str, Any]] = deque(maxlen=256)
 _FP8_CACHE_DTYPES = tuple(
     dtype
     for dtype in (
@@ -20,23 +17,6 @@ _FP8_CACHE_DTYPES = tuple(
     )
     if dtype is not None
 )
-
-
-def reset_dense_mla_debug_stats() -> None:
-    _DEBUG_STATS.clear()
-
-
-def get_dense_mla_debug_stats() -> list[dict[str, Any]]:
-    return list(_DEBUG_STATS)
-
-
-def _debug_enabled() -> bool:
-    return os.getenv("ATOM_RTP_DENSE_MLA_DEBUG", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
 
 
 def _raise_cache_error(message: str) -> None:
@@ -449,37 +429,6 @@ class RTPDenseMlaBackend:
                 "GLM5 RTP dense MLA decode requires a readable BF16/FP16 kv_cache_base."
             )
 
-    @staticmethod
-    def _record_debug(
-        *,
-        layer_id: int,
-        is_prefill: bool,
-        query_seq_len: int,
-        key_seq_len: int,
-        q: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        if not _debug_enabled():
-            return
-        detached = output.detach()
-        _DEBUG_STATS.append(
-            {
-                "layer_id": int(layer_id),
-                "is_prefill": bool(is_prefill),
-                "query_seq_len": int(query_seq_len),
-                "key_seq_len": int(key_seq_len),
-                "q_shape": tuple(q.shape),
-                "output_shape": tuple(output.shape),
-                "output_all_zero": bool((detached == 0).all().item()) if detached.numel() else True,
-                "output_max_abs": float(detached.float().abs().max().item())
-                if detached.numel()
-                else 0.0,
-                "output_mean_abs": float(detached.float().abs().mean().item())
-                if detached.numel()
-                else 0.0,
-            }
-        )
-
     def forward(
         self,
         q: torch.Tensor,
@@ -512,15 +461,6 @@ class RTPDenseMlaBackend:
         scale = float(q.shape[-1] ** -0.5)
         if metadata.is_prefill:
             output = self._causal_attention(q, key, value, query_start_loc, scale)
-            for start_tensor, end_tensor in zip(query_start_loc[:-1], query_start_loc[1:]):
-                self._record_debug(
-                    layer_id=layer_id,
-                    is_prefill=True,
-                    query_seq_len=int(end_tensor.item() - start_tensor.item()),
-                    key_seq_len=int(end_tensor.item() - start_tensor.item()),
-                    q=q,
-                    output=output,
-                )
             return output.to(dtype=compressed_kv.dtype)
 
         self._require_decode_cache_metadata(
@@ -553,14 +493,6 @@ class RTPDenseMlaBackend:
             hist_key, hist_value = self._project_kv(q_seg, hist_compressed_kv, hist_k_pe)
             pieces.append(
                 self._cross_causal_attention(q_seg, hist_key, hist_value, scale)
-            )
-            self._record_debug(
-                layer_id=layer_id,
-                is_prefill=False,
-                query_seq_len=end - start,
-                key_seq_len=int(hist_key.shape[0]),
-                q=q_seg,
-                output=pieces[-1],
             )
         output = torch.cat(pieces, dim=0) if pieces else value.new_empty((0, *value.shape[1:]))
         return output.to(dtype=compressed_kv.dtype)

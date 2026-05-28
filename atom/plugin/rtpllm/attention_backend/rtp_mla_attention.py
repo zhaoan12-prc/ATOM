@@ -95,6 +95,8 @@ class RTPMLAAttention:
             self.dense_backend = RTPSparseMlaBackend(
                 dense_backend=RTPDenseMlaBackend(mla_modules=mla_modules),
                 v_head_dim=mla_modules.v_head_dim,
+                mla_modules=mla_modules,
+                scale=kwargs.get("scale"),
             )
         else:
             self.dense_backend = None
