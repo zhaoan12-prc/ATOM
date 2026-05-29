@@ -787,15 +787,6 @@ class RTPSparseMlaBackend:
         }
 
     @staticmethod
-    def _strict_sparse() -> bool:
-        return os.getenv("ATOM_RTP_SPARSE_MLA_STRICT", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-
-    @staticmethod
     def _impl_accepts_positions(impl: object) -> bool:
         try:
             signature = inspect.signature(impl.forward)
@@ -879,8 +870,4 @@ class RTPSparseMlaBackend:
                 **kwargs,
             )
         except _SparseUnavailable:
-            if self._strict_sparse():
-                raise
-            return self._dense_forward(
-                q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices, positions
-            )
+            raise

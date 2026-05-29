@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -44,7 +43,6 @@ class RTPForwardContext:
     context: Context
     num_tokens: int
     mla_layer_map: Dict[int, Any]
-    use_rtp_indexer_cache: bool = False
     LayerMaps = tuple[Dict[int, GatedDeltaNet], Dict[int, Any], Dict[int, Any]]
 
     @staticmethod
@@ -1357,17 +1355,7 @@ class RTPForwardContext:
             context=context,
             num_tokens=int(positions.numel()),
             mla_layer_map=resolved_layer_maps[2],
-            use_rtp_indexer_cache=cls._use_rtp_indexer_cache(),
         )
-
-    @staticmethod
-    def _use_rtp_indexer_cache() -> bool:
-        return os.getenv("ATOM_RTP_USE_RTP_INDEXER_CACHE", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
 
     @staticmethod
     def _resolve_rtp_indexer_cache(
@@ -1423,38 +1411,6 @@ class RTPForwardContext:
         )
 
     @staticmethod
-    def _build_fallback_indexer_cache(
-        *,
-        cache_owner: Any,
-        layer_cache: Any,
-        indexer: Any,
-        block_size: int,
-    ) -> torch.Tensor | None:
-        kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
-        if kv_cache_base is None or kv_cache_base.dim() == 0:
-            return None
-        index_dim = int(getattr(indexer, "head_dim", 0) or 0) + 4
-        if index_dim <= 4:
-            return None
-        aligned_dim = ((index_dim + 15) // 16) * 16
-        num_tokens = int(kv_cache_base.shape[0]) * block_size
-        cached = getattr(cache_owner, "_rtp_indexer_kv_cache", None)
-        expected_shape = (num_tokens, 1, aligned_dim)
-        if (
-            cached is None
-            or tuple(cached.shape) != expected_shape
-            or cached.device != kv_cache_base.device
-            or cached.dtype != dtypes.fp8
-        ):
-            cached = torch.empty(
-                expected_shape,
-                device=kv_cache_base.device,
-                dtype=dtypes.fp8,
-            )
-            setattr(cache_owner, "_rtp_indexer_kv_cache", cached)
-        return cached
-
-    @staticmethod
     def _attach_mla_layer_caches(
         forward_context: "RTPForwardContext",
     ) -> tuple[list[tuple[Any, str, Any]], list[tuple[list[Any], int, Any]]]:
@@ -1486,22 +1442,12 @@ class RTPForwardContext:
                 or getattr(get_current_atom_config(), "kv_cache_block_size", 0)
                 or 1
             )
-            if bool(getattr(forward_context, "use_rtp_indexer_cache", False)):
-                indexer_cache_tensor = RTPForwardContext._resolve_rtp_indexer_cache(
-                    layer_num=layer_num,
-                    layer_cache=layer_cache,
-                    indexer=indexer,
-                    block_size=block_size,
-                )
-            else:
-                indexer_cache_tensor = RTPForwardContext._build_fallback_indexer_cache(
-                    cache_owner=cache_owner,
-                    layer_cache=layer_cache,
-                    indexer=indexer,
-                    block_size=block_size,
-                )
-            if indexer_cache_tensor is None:
-                continue
+            indexer_cache_tensor = RTPForwardContext._resolve_rtp_indexer_cache(
+                layer_num=layer_num,
+                layer_cache=layer_cache,
+                indexer=indexer,
+                block_size=block_size,
+            )
             restore_indices.append((indexer_kv_cache, 0, indexer_kv_cache[0]))
             indexer_kv_cache[0] = indexer_cache_tensor
         return restore_attrs, restore_indices
