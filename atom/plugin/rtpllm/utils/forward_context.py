@@ -783,11 +783,38 @@ class RTPForwardContext:
         ).contiguous()
 
     @staticmethod
+    def _expand_block_table_for_atom_indexer(
+        block_table: torch.Tensor,
+        *,
+        seq_size_per_block: int,
+        kernel_seq_size_per_block: int,
+    ) -> torch.Tensor:
+        if (
+            kernel_seq_size_per_block <= 0
+            or seq_size_per_block <= 0
+            or seq_size_per_block == kernel_seq_size_per_block
+        ):
+            return block_table
+        if seq_size_per_block % kernel_seq_size_per_block != 0:
+            raise ValueError(
+                "RTP plugin cannot expand block_table for ATOM indexer: "
+                f"seq_size_per_block={seq_size_per_block}, "
+                f"kernel_seq_size_per_block={kernel_seq_size_per_block}."
+            )
+        block_ratio = int(seq_size_per_block // kernel_seq_size_per_block)
+        offsets = torch.arange(block_ratio, device=block_table.device, dtype=torch.int32)
+        base = block_table.to(dtype=torch.int32)
+        expanded = base.unsqueeze(-1) * block_ratio + offsets
+        expanded = torch.where(base.unsqueeze(-1) >= 0, expanded, -1)
+        return expanded.reshape(base.shape[0], base.shape[1] * block_ratio).contiguous()
+
+    @staticmethod
     def _build_plugin_attention_metadata(
         *,
         attn_inputs: Any,
         positions: torch.Tensor,
         seq_size_per_block: int,
+        kernel_seq_size_per_block: int,
         cg_max_seq_len: int = 0,
         cg_bufs: dict | None = None,
     ) -> AttentionMetaData:
@@ -930,6 +957,14 @@ class RTPForwardContext:
             block_table_i32 = block_table.to(
                 device=device, dtype=torch.int32, non_blocking=True
             ).contiguous()
+        if in_capture:
+            indexer_block_table_i32 = block_table_i32
+        else:
+            indexer_block_table_i32 = RTPForwardContext._expand_block_table_for_atom_indexer(
+                block_table_i32,
+                seq_size_per_block=int(seq_size_per_block),
+                kernel_seq_size_per_block=int(kernel_seq_size_per_block),
+            )
         plugin_md = AiterFlashAttentionMetadataForPluginMode(
             num_actual_tokens=num_actual_tokens,
             num_actual_kv_tokens=num_actual_kv_tokens,
@@ -997,7 +1032,7 @@ class RTPForwardContext:
             cu_seqlens_k=query_start_loc,
             max_seqlen_q=max_query_len,
             max_seqlen_k=max_seq_len,
-            block_tables=plugin_md.block_table,
+            block_tables=indexer_block_table_i32,
             slot_mapping=slot_mapping,
             context_lens=seq_lens,
             cu_seqlen_ks=cu_seqlen_ks,
@@ -1281,6 +1316,7 @@ class RTPForwardContext:
             attn_inputs=attn_inputs,
             positions=positions,
             seq_size_per_block=seq_size_per_block,
+            kernel_seq_size_per_block=kernel_seq_size_per_block,
             cg_max_seq_len=int(cg_max_seq_len),
             cg_bufs=cg_bufs,
         )
