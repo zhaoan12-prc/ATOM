@@ -41,16 +41,80 @@ class _NoopModelWeightsLoader:
 
 
 class _ATOMGlm5AttnPyObj:
-    """Minimal attention object so RTP does not build native MLA fmha_impl."""
+    """Container returned to RTP CudaGraphRunner for replay-time hooks."""
 
-    is_cuda_graph = False
+    def __init__(self, runtime: "_ATOMGlm5MoeRuntime") -> None:
+        self._runtime = runtime
+        self.is_cuda_graph = False
+        self._rtp_mla_layers: list[Any] = []
+        self._rtp_sparse_mla_backends: list[Any] = []
+        self._rtp_dense_mla_backends: list[Any] = []
+        self._collect_mla_layers()
+
+    @staticmethod
+    def _append_unique(items: list[Any], value: Any) -> None:
+        if value is not None and all(value is not item for item in items):
+            items.append(value)
+
+    def _collect_mla_layers(self) -> None:
+        try:
+            from atom.plugin.rtpllm.attention_backend import (
+                RTPDenseMlaBackend,
+                RTPMLAAttention,
+                RTPSparseMlaBackend,
+            )
+        except (ImportError, ModuleNotFoundError):
+            RTPDenseMlaBackend = None
+            RTPMLAAttention = None
+            RTPSparseMlaBackend = None
+
+        candidates: list[Any] = []
+        _, _, mla_layer_map = self._runtime._rtp_layer_maps
+        candidates.extend(mla_layer_map.values())
+        for module in self._runtime.model.modules():
+            candidates.append(module)
+            mla_attn = getattr(module, "mla_attn", None)
+            if mla_attn is not None:
+                candidates.append(mla_attn)
+
+        for candidate in candidates:
+            if RTPMLAAttention is not None and isinstance(candidate, RTPMLAAttention):
+                self._append_unique(self._rtp_mla_layers, candidate)
+                backend = getattr(candidate, "dense_backend", None)
+            else:
+                backend = getattr(candidate, "dense_backend", None)
+                if backend is None and RTPSparseMlaBackend is not None and isinstance(
+                    candidate, RTPSparseMlaBackend
+                ):
+                    backend = candidate
+
+            if RTPSparseMlaBackend is not None and isinstance(
+                backend, RTPSparseMlaBackend
+            ):
+                self._append_unique(self._rtp_sparse_mla_backends, backend)
+                dense_backend = getattr(backend, "dense_backend", None)
+                if RTPDenseMlaBackend is not None and isinstance(
+                    dense_backend, RTPDenseMlaBackend
+                ):
+                    self._append_unique(self._rtp_dense_mla_backends, dense_backend)
+            elif RTPDenseMlaBackend is not None and isinstance(
+                backend, RTPDenseMlaBackend
+            ):
+                self._append_unique(self._rtp_dense_mla_backends, backend)
 
     @property
     def fmha_params(self):
         return None
 
     def prepare_cuda_graph(self, attn_inputs) -> None:  # noqa: ANN001
-        return None
+        for layer in self._rtp_mla_layers:
+            prepare = getattr(layer, "prepare_cuda_graph", None)
+            if callable(prepare):
+                prepare(attn_inputs)
+        for backend in self._rtp_sparse_mla_backends + self._rtp_dense_mla_backends:
+            prepare = getattr(backend, "prepare_cuda_graph", None)
+            if callable(prepare):
+                prepare(attn_inputs)
 
 
 class _ATOMGlm5MoeRuntime(GptModelBase):
@@ -90,12 +154,20 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
         self._rtp_kv_cache_signature: tuple | None = None
         self._rtp_layer_group_map: dict[int, int] | None = None
         self._rtp_layer_group_map_signature: tuple | None = None
+        decode_caps = getattr(py_hw_kernel_config, "decode_capture_batch_sizes", None)
+        if decode_caps:
+            self._cg_max_num_tokens: int = min(
+                int(max(decode_caps)), int(max_generate_batch_size)
+            )
+        else:
+            self._cg_max_num_tokens: int = int(max_generate_batch_size)
         self._cg_max_seq_len: int = int(
             getattr(model_config, "max_seq_len", 0)
             or getattr(model_config, "max_position_embeddings", 0)
             or 32768
         )
         self._atom_attn_pyobj: _ATOMGlm5AttnPyObj | None = None
+        self._cg_layers_prewarmed: bool = False
 
     def load_weights(self):
         return None
@@ -104,11 +176,128 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
         self, inputs: PyModelInputs, is_cuda_graph: bool = False
     ) -> _ATOMGlm5AttnPyObj:
         if self._atom_attn_pyobj is None:
-            self._atom_attn_pyobj = _ATOMGlm5AttnPyObj()
+            self._atom_attn_pyobj = _ATOMGlm5AttnPyObj(self)
         self._atom_attn_pyobj.is_cuda_graph = bool(is_cuda_graph)
         if bool(is_cuda_graph):
             inputs.attention_inputs.is_cuda_graph = True
+            self._ensure_cuda_graph_prewarmed()
         return self._atom_attn_pyobj
+
+    def _ensure_cuda_graph_prewarmed(self) -> None:
+        if self._cg_layers_prewarmed:
+            return
+        if self._atom_attn_pyobj is None:
+            return
+
+        max_num_tokens = int(self._cg_max_num_tokens)
+        max_seq_len = int(self._cg_max_seq_len)
+        if max_num_tokens <= 0 or max_seq_len <= 0:
+            logger.warning(
+                "ATOM GLM5 cuda-graph prewarm skipped: invalid budget "
+                "(max_num_tokens=%d, max_seq_len=%d)",
+                max_num_tokens,
+                max_seq_len,
+            )
+            return
+
+        device = self._get_model_device()
+        dtype = self._get_model_dtype()
+        kv_cache = getattr(self, "kv_cache", None)
+        seq_size_per_block = (
+            int(getattr(kv_cache, "seq_size_per_block", 0))
+            or int(os.getenv("SEQ_SIZE_PER_BLOCK", "0") or 0)
+            or 1
+        )
+        kernel_seq_size_per_block = (
+            int(getattr(kv_cache, "kernel_seq_size_per_block", 0))
+            or int(os.getenv("KERNEL_SEQ_SIZE_PER_BLOCK", "0") or 0)
+            or seq_size_per_block
+        )
+        physical_max_blocks = (
+            int(max_seq_len) + seq_size_per_block - 1
+        ) // seq_size_per_block + 1
+        recovered_physical_max_blocks = (
+            int(max_seq_len) + seq_size_per_block - 1
+        ) // seq_size_per_block
+        indexer_max_blocks = (
+            int(max_seq_len) + kernel_seq_size_per_block - 1
+        ) // kernel_seq_size_per_block + 1
+        block_table_max_blocks = max(physical_max_blocks, indexer_max_blocks)
+
+        for backend in self._atom_attn_pyobj._rtp_sparse_mla_backends:
+            prewarm = getattr(backend, "prewarm_for_cuda_graph", None)
+            if callable(prewarm):
+                prewarm(
+                    max_num_tokens=max_num_tokens,
+                    max_seq_len=max_seq_len,
+                    query_dtype=dtype,
+                    device=device,
+                )
+        for backend in self._atom_attn_pyobj._rtp_dense_mla_backends:
+            prewarm = getattr(backend, "prewarm_for_cuda_graph", None)
+            if callable(prewarm):
+                prewarm(
+                    max_num_tokens=max_num_tokens,
+                    max_seq_len=max_seq_len,
+                    query_dtype=dtype,
+                    device=device,
+                )
+
+        self._cg_meta_bufs: dict[str, torch.Tensor] = {
+            "query_start_loc": torch.arange(
+                0, max_num_tokens + 1, device=device, dtype=torch.int32
+            ),
+            "seq_id": torch.arange(0, max_num_tokens, device=device, dtype=torch.int64),
+            "seq_id_i32": torch.arange(
+                0, max_num_tokens, device=device, dtype=torch.int32
+            ),
+            "positions_i32": torch.empty(
+                max_num_tokens, device=device, dtype=torch.int32
+            ),
+            "block_col": torch.empty(max_num_tokens, device=device, dtype=torch.int32),
+            "block_col_i64": torch.empty(
+                max_num_tokens, device=device, dtype=torch.int64
+            ),
+            "slot_base": torch.empty(max_num_tokens, device=device, dtype=torch.int32),
+            "token_offset": torch.empty(
+                max_num_tokens, device=device, dtype=torch.int32
+            ),
+            "slot_mapping": torch.empty(
+                max_num_tokens, device=device, dtype=torch.int64
+            ),
+            "seq_lens_i32": torch.empty(
+                max_num_tokens, device=device, dtype=torch.int32
+            ),
+            "physical_block_table_i32": torch.empty(
+                max_num_tokens,
+                recovered_physical_max_blocks,
+                device=device,
+                dtype=torch.int32,
+            ),
+            "block_table_i32": torch.empty(
+                max_num_tokens, block_table_max_blocks, device=device, dtype=torch.int32
+            ),
+            "indexer_block_table_i32": torch.empty(
+                max_num_tokens, indexer_max_blocks, device=device, dtype=torch.int32
+            ),
+        }
+        self._cg_layers_prewarmed = True
+        logger.info(
+            "ATOM GLM5 cuda-graph prewarmed "
+            "(max_num_tokens=%d, max_seq_len=%d, sparse_layers=%d, dense_layers=%d, "
+            "physical_block_table_i32[%dx%d], block_table_i32[%dx%d], "
+            "indexer_block_table_i32[%dx%d])",
+            max_num_tokens,
+            max_seq_len,
+            len(self._atom_attn_pyobj._rtp_sparse_mla_backends),
+            len(self._atom_attn_pyobj._rtp_dense_mla_backends),
+            max_num_tokens,
+            recovered_physical_max_blocks,
+            max_num_tokens,
+            block_table_max_blocks,
+            max_num_tokens,
+            indexer_max_blocks,
+        )
 
     @staticmethod
     def _get_forward_context_cls():
@@ -261,7 +450,8 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
         return positions
 
     def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:  # noqa: ANN001
-        if bool(getattr(fmha_impl, "is_cuda_graph", False)):
+        is_cuda_graph = bool(getattr(fmha_impl, "is_cuda_graph", False))
+        if is_cuda_graph:
             inputs.attention_inputs.is_cuda_graph = True
         model_device = self._get_model_device()
         model_dtype = self._get_model_dtype()
@@ -278,6 +468,8 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
         positions = self._extract_positions(
             inputs=inputs, model_device=model_device, token_num=token_num
         )
+        if is_cuda_graph and token_num > 0:
+            positions = positions[:token_num]
         if input_ids is None or input_ids.numel() == 0:
             inputs_embeds = inputs.input_hiddens
             if (

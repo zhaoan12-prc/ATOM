@@ -24,6 +24,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -94,6 +95,67 @@ from transformers import PretrainedConfig
 
 
 logger = logging.getLogger("atom")
+
+
+def _rtp_cg_debug_enabled(num_tokens: Optional[int] = None) -> bool:
+    enabled = os.getenv("ATOM_RTP_CG_DEBUG", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not enabled:
+        return False
+    if num_tokens is not None:
+        max_tokens = int(os.getenv("ATOM_RTP_CG_DEBUG_MAX_TOKENS", "2"))
+        if int(num_tokens) > max_tokens:
+            return False
+    return True
+
+
+def _rtp_tensor_desc(tensor: Optional[torch.Tensor]) -> str:
+    if not isinstance(tensor, torch.Tensor):
+        return "None"
+    return (
+        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device} "
+        f"contig={tensor.is_contiguous()} stride={tuple(tensor.stride())}"
+    )
+
+
+def _rtp_debug_values(tensor: Optional[torch.Tensor], limit: int = 8) -> str:
+    if not isinstance(tensor, torch.Tensor):
+        return "None"
+    if not _rtp_cg_debug_values_enabled():
+        return "disabled"
+    flat = tensor.reshape(-1)[:limit].detach().cpu().tolist()
+    return str(flat)
+
+
+def _rtp_cg_debug_log(tag: str, *, sync: bool = False, **kwargs) -> None:
+    extras = " ".join(f"{key}={value}" for key, value in kwargs.items())
+    print(f"[ATOM_RTP_CG_DEBUG][deepseek_v2] {tag} {extras}", flush=True)
+    if sync and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _rtp_cg_debug_sync_enabled() -> bool:
+    return os.getenv("ATOM_RTP_CG_DEBUG_SYNC", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _rtp_cg_debug_values_enabled() -> bool:
+    return os.getenv("ATOM_RTP_CG_DEBUG_VALUES", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 if use_triton_gemm():
     try:
         from aiter.ops.triton.gemm_a8w8_blockscale import (
@@ -885,10 +947,38 @@ class DeepseekV2MoE(nn.Module):
                 )
 
     def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        debug = _rtp_cg_debug_enabled(hidden_states.shape[0])
+        sync_debug = debug and _rtp_cg_debug_sync_enabled()
+        if debug:
+            _rtp_cg_debug_log(
+                "moe.routed.before_gate",
+                prefix=self.prefix,
+                hidden=_rtp_tensor_desc(hidden_states),
+            )
         router_logits = self.gate(hidden_states)
+        if debug:
+            _rtp_cg_debug_log(
+                "moe.routed.after_gate",
+                sync=sync_debug,
+                prefix=self.prefix,
+                logits=_rtp_tensor_desc(router_logits),
+            )
+            _rtp_cg_debug_log(
+                "moe.routed.before_experts",
+                prefix=self.prefix,
+                hidden=_rtp_tensor_desc(hidden_states),
+                logits=_rtp_tensor_desc(router_logits),
+            )
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
+        if debug:
+            _rtp_cg_debug_log(
+                "moe.routed.after_experts",
+                sync=sync_debug,
+                prefix=self.prefix,
+                out=_rtp_tensor_desc(final_hidden_states),
+            )
         return final_hidden_states
 
     def combine_outputs(
@@ -936,17 +1026,46 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        debug = _rtp_cg_debug_enabled(hidden_states.shape[0])
+        sync_debug = debug and _rtp_cg_debug_sync_enabled()
         shared_output = None
         if (
             self.n_shared_experts is not None
             and not is_rocm_aiter_fusion_shared_expert_enabled()
         ):
+            if debug:
+                _rtp_cg_debug_log(
+                    "moe.single.before_shared",
+                    prefix=self.prefix,
+                    hidden=_rtp_tensor_desc(hidden_states),
+                )
             shared_output = self.shared_experts(hidden_states)
+            if debug:
+                _rtp_cg_debug_log(
+                    "moe.single.after_shared",
+                    sync=sync_debug,
+                    prefix=self.prefix,
+                    out=_rtp_tensor_desc(shared_output),
+                )
 
         final_hidden_states = self.routed_expert_forward(hidden_states)
+        if debug:
+            _rtp_cg_debug_log(
+                "moe.single.before_combine",
+                prefix=self.prefix,
+                routed=_rtp_tensor_desc(final_hidden_states),
+                shared=_rtp_tensor_desc(shared_output),
+            )
         final_hidden_states = self.combine_outputs(
             final_hidden_states, shared_output, hidden_states
         )
+        if debug:
+            _rtp_cg_debug_log(
+                "moe.single.after_combine",
+                sync=sync_debug,
+                prefix=self.prefix,
+                out=_rtp_tensor_desc(final_hidden_states),
+            )
         return final_hidden_states
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1014,6 +1133,21 @@ def sparse_attn_indexer(
     attn_metadata = forward_context.attn_metadata
     context = forward_context.context
     slot_mapping = attn_metadata.slot_mapping
+    debug = _rtp_cg_debug_enabled(hidden_states.shape[0])
+    sync_debug = debug and _rtp_cg_debug_sync_enabled()
+    if debug:
+        _rtp_cg_debug_log(
+            "indexer.enter",
+            hidden=_rtp_tensor_desc(hidden_states),
+            q_input=_rtp_tensor_desc(q_input),
+            k=_rtp_tensor_desc(k),
+            weights=_rtp_tensor_desc(weights),
+            slot_mapping=_rtp_tensor_desc(slot_mapping),
+            is_prefill=getattr(context, "is_prefill", None),
+            batch_size=getattr(context, "batch_size", None),
+            max_seqlen_q=getattr(attn_metadata, "max_seqlen_q", None),
+            max_seqlen_k=getattr(attn_metadata, "max_seqlen_k", None),
+        )
     # Skip for dummy runs to avoid corrupting KV cache
     if forward_context.context.is_dummy_run:
         # dummy runner
@@ -1025,6 +1159,14 @@ def sparse_attn_indexer(
     runner_block_size = get_current_atom_config().kv_cache_block_size
     kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
     if use_qk_rope_cache_fusion:
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.before_qk_rope_quant_cache",
+                q_input=_rtp_tensor_desc(q_input),
+                k=_rtp_tensor_desc(k),
+                kv_cache=_rtp_tensor_desc(kv_cache),
+                positions=_rtp_tensor_desc(positions),
+            )
         q_bf16 = q_input
         q_fp8 = torch.empty_like(q_bf16, dtype=dtypes.fp8)
         weights_out = torch.empty(
@@ -1050,8 +1192,22 @@ def sparse_attn_indexer(
             preshuffle=True,
             is_neox=is_neox_style,
         )
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.after_qk_rope_quant_cache",
+                sync=sync_debug,
+                q_fp8=_rtp_tensor_desc(q_fp8),
+                weights_out=_rtp_tensor_desc(weights_out),
+            )
         weights = weights_out
     else:
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.before_k_quant_cache",
+                k=_rtp_tensor_desc(k),
+                kv_cache=_rtp_tensor_desc(kv_cache),
+                slot_mapping=_rtp_tensor_desc(slot_mapping),
+            )
         q_fp8 = q_input
         indexer_k_quant_and_cache(
             k,
@@ -1061,10 +1217,24 @@ def sparse_attn_indexer(
             scale_fmt,
             preshuffle=True,
         )
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.after_k_quant_cache",
+                sync=sync_debug,
+                q_fp8=_rtp_tensor_desc(q_fp8),
+            )
     if context.is_prefill:
         if attn_metadata.max_seqlen_k <= topk_indices_buffer.shape[1]:
             return weights
         prefill_metadata = attn_metadata
+        plugin_metadata = getattr(prefill_metadata, "plugin_metadata", None)
+        physical_block_tables = getattr(plugin_metadata, "block_table", None)
+        block_tables_for_indexer = (
+            physical_block_tables
+            if isinstance(physical_block_tables, torch.Tensor)
+            and physical_block_tables.numel() > 0
+            else prefill_metadata.block_tables
+        )
         num_prefills = context.batch_size
         total_seq_lens = hidden_states.shape[0]
         # When has_cached, gather full KV (cached + new) for indexer top-k
@@ -1073,19 +1243,27 @@ def sparse_attn_indexer(
         )
         k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
         k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
-        if prefill_metadata.block_tables.shape[0] < num_prefills:
-            new_shape = (num_prefills, prefill_metadata.block_tables.shape[1])
-            prefill_metadata.block_tables = torch.full(
+        if block_tables_for_indexer.shape[0] < num_prefills:
+            new_shape = (num_prefills, block_tables_for_indexer.shape[1])
+            block_tables_for_indexer = torch.full(
                 new_shape,
                 -1,
                 dtype=torch.long,
-                device=prefill_metadata.block_tables.device,
+                device=block_tables_for_indexer.device,
+            )
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.prefill.before_cp_gather",
+                kv_cache=_rtp_tensor_desc(kv_cache),
+                k_fp8=_rtp_tensor_desc(k_fp8),
+                k_scale=_rtp_tensor_desc(k_scale),
+                block_tables=_rtp_tensor_desc(block_tables_for_indexer),
             )
         cp_gather_indexer_k_quant_cache(
             kv_cache,
             k_fp8,
             k_scale.view(dtypes.fp8),
-            prefill_metadata.block_tables,
+            block_tables_for_indexer,
             (
                 prefill_metadata.cu_seqlens_k
                 if prefill_metadata.has_cached
@@ -1093,9 +1271,25 @@ def sparse_attn_indexer(
             ),
             preshuffle=True,
         )
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.prefill.after_cp_gather",
+                sync=sync_debug,
+                k_fp8=_rtp_tensor_desc(k_fp8),
+                k_scale=_rtp_tensor_desc(k_scale),
+            )
         cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
         cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
         num_tokens = hidden_states.shape[0]
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.prefill.before_fp8_mqa_logits",
+                q=_rtp_tensor_desc(q_fp8[num_decode_tokens:num_tokens]),
+                kv=_rtp_tensor_desc(k_fp8),
+                weights=_rtp_tensor_desc(weights[num_decode_tokens:num_tokens]),
+                cu_starts=_rtp_tensor_desc(cu_seqlen_ks),
+                cu_ends=_rtp_tensor_desc(cu_seqlen_ke),
+            )
         logits = fp8_mqa_logits(
             Q=q_fp8[num_decode_tokens:num_tokens],
             KV=k_fp8,
@@ -1104,10 +1298,23 @@ def sparse_attn_indexer(
             cu_starts=cu_seqlen_ks,
             cu_ends=cu_seqlen_ke,
         )
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.prefill.after_fp8_mqa_logits",
+                sync=sync_debug,
+                logits=_rtp_tensor_desc(logits),
+            )
 
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices = topk_indices_buffer[num_decode_tokens:num_tokens, :topk_tokens]
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.prefill.before_topk",
+                logits=_rtp_tensor_desc(logits),
+                topk_indices=_rtp_tensor_desc(topk_indices),
+                num_rows=num_rows,
+            )
         top_k_per_row_prefill(
             logits=logits,
             rowStarts=cu_seqlen_ks,
@@ -1118,6 +1325,12 @@ def sparse_attn_indexer(
             stride0=logits.stride(0),
             stride1=logits.stride(1),
         )
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.prefill.after_topk",
+                sync=sync_debug,
+                topk_indices=_rtp_tensor_desc(topk_indices),
+            )
     else:
         decode_metadata = attn_metadata
         # kv_cache size requirement [num_block, block_size, n_head, head_dim],
@@ -1135,6 +1348,23 @@ def sparse_attn_indexer(
         logits = torch.empty(
             [batch_size * next_n, max_model_len], dtype=torch.float32, device="cuda"
         )
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.decode.before_paged_mqa_logits",
+                q=_rtp_tensor_desc(padded_q_fp8_decode_tokens),
+                kv_cache=_rtp_tensor_desc(kv_cache),
+                weights=_rtp_tensor_desc(weights[:num_padded_tokens]),
+                logits=_rtp_tensor_desc(logits),
+                context_lens=_rtp_tensor_desc(decode_metadata.context_lens),
+                block_tables=_rtp_tensor_desc(attn_metadata.block_tables),
+                context_lens_values=_rtp_debug_values(decode_metadata.context_lens),
+                block_table_head_values=_rtp_debug_values(attn_metadata.block_tables[0]),
+                batch_size=batch_size,
+                next_n=next_n,
+                num_padded_tokens=num_padded_tokens,
+                max_model_len=max_model_len,
+                max_seqlen_k=getattr(attn_metadata, "max_seqlen_k", None),
+            )
         deepgemm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
@@ -1146,9 +1376,24 @@ def sparse_attn_indexer(
             KVBlockSize=runner_block_size,
             Preshuffle=True,
         )
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.decode.after_paged_mqa_logits",
+                sync=sync_debug,
+                logits=_rtp_tensor_desc(logits),
+            )
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.decode.before_topk",
+                logits=_rtp_tensor_desc(logits),
+                next_n=next_n,
+                context_lens=_rtp_tensor_desc(decode_metadata.context_lens),
+                topk_indices=_rtp_tensor_desc(topk_indices),
+                num_rows=num_rows,
+            )
         top_k_per_row_decode(
             logits,
             next_n,
@@ -1158,6 +1403,12 @@ def sparse_attn_indexer(
             logits.stride(0),
             logits.stride(1),
         )
+        if debug:
+            _rtp_cg_debug_log(
+                "indexer.decode.after_topk",
+                sync=sync_debug,
+                topk_indices=_rtp_tensor_desc(topk_indices),
+            )
     return weights
 
 
