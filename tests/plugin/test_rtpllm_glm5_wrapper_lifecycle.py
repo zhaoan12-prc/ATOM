@@ -318,3 +318,60 @@ def test_glm5_runtime_prepare_fmha_impl_bypasses_native_mla_factory(monkeypatch)
     assert attn_pyobj.is_cuda_graph is False
     assert hasattr(attn_pyobj, "prepare_cuda_graph")
 
+
+def test_glm5_runtime_decode_positions_prefer_sequence_lengths_plus_one():
+    fake_modules = _install_fake_rtp_modules()
+
+    with patch.dict(sys.modules, fake_modules), patch.dict(
+        os.environ,
+        {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+    ):
+        sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
+        module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
+        module = importlib.reload(module)
+        runtime = object.__new__(module._ATOMGlm5MoeRuntime)
+        attn_inputs = SimpleNamespace(
+            input_lengths=torch.tensor([1, 2], dtype=torch.int32),
+            is_prefill=False,
+            sequence_lengths=torch.tensor([999, 999], dtype=torch.int32),
+            sequence_lengths_plus_1_d=torch.tensor([35, 50], dtype=torch.int32),
+        )
+
+        positions = runtime._build_positions_from_attention_inputs(
+            attn_inputs=attn_inputs,
+            model_device=torch.device("cpu"),
+        )
+
+    assert positions.cpu().tolist() == [34, 48, 49]
+
+
+def test_glm5_runtime_graph_decode_ignores_stale_position_ids():
+    fake_modules = _install_fake_rtp_modules()
+
+    with patch.dict(sys.modules, fake_modules), patch.dict(
+        os.environ,
+        {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
+    ):
+        sys.modules.pop("atom.plugin.rtpllm.models.glm5", None)
+        module = importlib.import_module("atom.plugin.rtpllm.models.glm5")
+        module = importlib.reload(module)
+        runtime = object.__new__(module._ATOMGlm5MoeRuntime)
+        inputs = SimpleNamespace(
+            bert_embedding_inputs=None,
+            attention_inputs=SimpleNamespace(
+                input_lengths=torch.tensor([1, 2], dtype=torch.int32),
+                is_prefill=False,
+                is_cuda_graph=True,
+                position_ids=torch.tensor([0, 0, 0], dtype=torch.int32),
+                sequence_lengths_plus_1_d=torch.tensor([35, 50], dtype=torch.int32),
+            ),
+        )
+
+        positions = runtime._extract_positions(
+            inputs=inputs,
+            model_device=torch.device("cpu"),
+            token_num=3,
+        )
+
+    assert positions.cpu().tolist() == [34, 48, 49]
+
