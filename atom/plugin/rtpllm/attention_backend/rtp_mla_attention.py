@@ -55,6 +55,13 @@ def _should_emit_topk_indices(attn) -> bool:
     return True
 
 
+def _use_rtp_sparse_attn_indexer(indexer: object | None) -> None:
+    if indexer is None or not hasattr(indexer, "sparse_attn_indexer_impl"):
+        return
+    __import__("atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend")
+    indexer.sparse_attn_indexer_impl = torch.ops.aiter.rtp_sparse_attn_indexer
+
+
 class RTPMLAAttention:
     """Dense RTP MLA adapter for the native GLM5 MLA call contract."""
 
@@ -69,6 +76,7 @@ class RTPMLAAttention:
         self.o_proj = getattr(mla_modules, "o_proj", None)
         self.kv_b_proj = getattr(mla_modules, "kv_b_proj", None)
         self.indexer = getattr(mla_modules, "indexer", None)
+        _use_rtp_sparse_attn_indexer(self.indexer)
         self.qk_head_dim = getattr(mla_modules, "qk_head_dim", None)
         self.v_head_dim = getattr(mla_modules, "v_head_dim", None)
         self.q_lora_rank = getattr(mla_modules, "q_lora_rank", None)

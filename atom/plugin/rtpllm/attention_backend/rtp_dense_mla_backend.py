@@ -50,6 +50,19 @@ class RTPDenseMlaBackend:
         self.qk_rope_head_dim = getattr(mla_modules, "qk_rope_head_dim", None)
         self._projection_checked = False
 
+    def prepare_cuda_graph(self, attn_inputs) -> None:  # noqa: ANN001
+        del attn_inputs
+
+    def prewarm_for_cuda_graph(
+        self,
+        *,
+        max_num_tokens: int,
+        max_seq_len: int,
+        query_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        del max_num_tokens, max_seq_len, query_dtype, device
+
     @staticmethod
     def _read_is_prefill(context: Any) -> bool:
         if context is None or not hasattr(context, "is_prefill"):
@@ -62,19 +75,19 @@ class RTPDenseMlaBackend:
     def _get_metadata(num_tokens: int, device: torch.device) -> _DenseMlaMetadata:
         attn_metadata = None
         context = None
-        rtp_seq_size_per_block = 1
+        rtp_seq_size_per_block = 0
         try:
             from atom.utils.forward_context import get_forward_context
 
             forward_context = get_forward_context()
             attn_metadata = getattr(forward_context, "attn_metadata", None)
             context = getattr(forward_context, "context", None)
+            plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
             rtp_seq_size_per_block = int(
-                getattr(attn_metadata, "rtp_seq_size_per_block", 0)
-                or getattr(attn_metadata, "rtp_kernel_seq_size_per_block", 0)
+                getattr(plugin_metadata, "sparse_block_size", 0)
+                or getattr(attn_metadata, "rtp_seq_size_per_block", 0)
                 or 0
             )
-            plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
             query_start_loc = getattr(plugin_metadata, "query_start_loc", None)
             if query_start_loc is None:
                 query_start_loc = getattr(plugin_metadata, "rtp_cu_seqlens_q", None)
@@ -378,17 +391,26 @@ class RTPDenseMlaBackend:
         )
         if flat_cache is None:
             return None
+        block_size = int(metadata.block_size)
+        kv_cache_base = getattr(layer_cache, "kv_cache_base", None)
+        if (
+            block_size <= 1
+            and isinstance(kv_cache_base, torch.Tensor)
+            and kv_cache_base.dim() == 3
+            and int(kv_cache_base.shape[-1]) == kv_dim
+        ):
+            block_size = int(kv_cache_base.shape[1])
         seq_len = int(metadata.seq_lens[batch_idx].item())
         if seq_len <= 0:
             return None
         block_row = metadata.block_table[batch_idx].long()
         positions = torch.arange(seq_len, dtype=torch.long, device=flat_cache.device)
-        block_cols = torch.div(positions, metadata.block_size, rounding_mode="floor")
+        block_cols = torch.div(positions, block_size, rounding_mode="floor")
         block_col_max = int(block_cols.max().item())
         if block_col_max >= int(block_row.numel()):
             return None
-        offsets = positions.remainder(metadata.block_size)
-        slots = block_row[block_cols] * metadata.block_size + offsets
+        offsets = positions.remainder(block_size)
+        slots = block_row[block_cols] * block_size + offsets
         flat_size = int(flat_cache.shape[0])
         if bool(((slots < 0) | (slots >= flat_size)).any().item()):
             bad_slots = slots[(slots < 0) | (slots >= flat_size)]
