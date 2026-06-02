@@ -38,6 +38,98 @@ def _load_sparse_backend(monkeypatch):
     return module.RTPSparseMlaBackend
 
 
+def test_rtp_sparse_attn_indexer_bridge_forwards_to_main_indexer(monkeypatch):
+    module = importlib.import_module(_SPARSE_BACKEND_MODULE)
+    calls = []
+    expected = torch.empty(1)
+
+    def fake_sparse_attn_indexer(*args):
+        calls.append(args)
+        return expected
+
+    fake_deepseek = type(sys)("atom.models.deepseek_v2")
+    fake_deepseek.sparse_attn_indexer = fake_sparse_attn_indexer
+    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", fake_deepseek)
+
+    tensor = torch.empty(1)
+    output = module.rtp_sparse_attn_indexer(
+        tensor,
+        "indexer.prefix",
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        128,
+        None,
+        2048,
+        64,
+        4096,
+        1,
+        tensor,
+        tensor,
+        tensor,
+        1e-6,
+        tensor,
+        tensor,
+        tensor,
+        1.0,
+        True,
+        False,
+    )
+
+    assert output is expected
+    assert len(calls) == 1
+    assert calls[0][0] is tensor
+    assert calls[0][1] == "indexer.prefix"
+    assert calls[0][6:12] == (128, None, 2048, 64, 4096, 1)
+
+
+def test_rtp_sparse_attn_indexer_fake_bridge_forwards_to_main_fake(monkeypatch):
+    module = importlib.import_module(_SPARSE_BACKEND_MODULE)
+    calls = []
+    expected = torch.empty(1)
+
+    def fake_sparse_attn_indexer_fake(*args):
+        calls.append(args)
+        return expected
+
+    fake_deepseek = type(sys)("atom.models.deepseek_v2")
+    fake_deepseek.sparse_attn_indexer_fake = fake_sparse_attn_indexer_fake
+    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", fake_deepseek)
+
+    tensor = torch.empty(1)
+    output = module.rtp_sparse_attn_indexer_fake(
+        tensor,
+        "indexer.prefix",
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        128,
+        None,
+        2048,
+        64,
+        4096,
+        1,
+        tensor,
+        tensor,
+        tensor,
+        1e-6,
+        tensor,
+        tensor,
+        tensor,
+        1.0,
+        True,
+        False,
+    )
+
+    assert output is expected
+    assert len(calls) == 1
+    assert calls[0][0] is tensor
+    assert calls[0][1] == "indexer.prefix"
+    assert calls[0][6:12] == (128, None, 2048, 64, 4096, 1)
+
+
 class _FakeDenseBackend:
     def __init__(self, v_head_dim: int = 5):
         self.v_head_dim = v_head_dim
@@ -198,6 +290,76 @@ def test_sparse_backend_pulls_attn_metadata_from_forward_context(monkeypatch):
     backend.forward(q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=topk)
 
     assert sparse_impl.calls[0]["attn_metadata"] is attn_metadata
+
+
+def test_sparse_backend_prefill_missing_flashmla_falls_back_to_dense(monkeypatch):
+    backend_cls = _load_sparse_backend(monkeypatch)
+    module = importlib.import_module(_SPARSE_BACKEND_MODULE)
+    forward_context_mod = sys.modules["atom.utils.forward_context"]
+
+    attn_metadata = SimpleNamespace(
+        plugin_metadata=SimpleNamespace(num_prefills=1, is_dummy_warmup=False)
+    )
+    fake_forward_context = SimpleNamespace(
+        context=SimpleNamespace(is_dummy_run=False),
+        attn_metadata=attn_metadata,
+    )
+    monkeypatch.setattr(
+        forward_context_mod,
+        "get_forward_context",
+        lambda: fake_forward_context,
+        raising=False,
+    )
+
+    class _MissingPrefillSparse:
+        def forward(self, *args, **kwargs):
+            raise module._SparseUnavailable("flash_mla_sparse_fwd unavailable")
+
+    dense_backend = _FakeDenseBackend()
+    backend = _build_backend(backend_cls, dense_backend, _MissingPrefillSparse())
+    q, compressed_kv, k_pe, kv_cache, layer_id = _make_inputs()
+    topk = torch.tensor([[1, 0], [0, 1], [1, 1]], dtype=torch.int32)
+
+    output = backend.forward(q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=topk)
+
+    assert output.shape == (3, 2, dense_backend.v_head_dim)
+    assert len(dense_backend.calls) == 1
+    assert dense_backend.calls[0]["topk_indices"] is topk
+
+
+def test_sparse_backend_decode_missing_sparse_kernel_still_raises(monkeypatch):
+    backend_cls = _load_sparse_backend(monkeypatch)
+    module = importlib.import_module(_SPARSE_BACKEND_MODULE)
+    forward_context_mod = sys.modules["atom.utils.forward_context"]
+
+    attn_metadata = SimpleNamespace(
+        plugin_metadata=SimpleNamespace(num_prefills=0, is_dummy_warmup=False)
+    )
+    fake_forward_context = SimpleNamespace(
+        context=SimpleNamespace(is_dummy_run=False),
+        attn_metadata=attn_metadata,
+    )
+    monkeypatch.setattr(
+        forward_context_mod,
+        "get_forward_context",
+        lambda: fake_forward_context,
+        raising=False,
+    )
+
+    class _MissingDecodeSparse:
+        def forward(self, *args, **kwargs):
+            raise module._SparseUnavailable("flash_mla_sparse_fwd unavailable")
+
+    backend = _build_backend(backend_cls, _FakeDenseBackend(), _MissingDecodeSparse())
+    q, compressed_kv, k_pe, kv_cache, layer_id = _make_inputs()
+    topk = torch.tensor([[1, 0], [0, 1], [1, 1]], dtype=torch.int32)
+
+    try:
+        backend.forward(q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices=topk)
+    except module._SparseUnavailable:
+        pass
+    else:
+        raise AssertionError("decode sparse unavailability must not fall back to dense")
 
 
 def test_sparse_backend_forward_signature_matches_dense_boundary(monkeypatch):

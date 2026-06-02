@@ -550,15 +550,13 @@ def test_default_dense_mla_backend_decode_rebuilds_stale_query_start_loc(monkeyp
     assert layer_cache.kv_cache_base[0, 1].tolist() == [9.0, 9.0, 9.0, 9.0]
 
 
-def test_default_sparse_wrapper_validates_topk_but_falls_back_to_dense(monkeypatch):
+def test_default_sparse_wrapper_refuses_mock_dense_fallback(monkeypatch):
     _guard_sparse_kernel_imports(monkeypatch)
-    from atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend import (
-        RTPSparseMlaBackend,
-    )
+    from atom.plugin.rtpllm.attention_backend import rtp_sparse_mla_backend
 
     dense_backend = _FakeDenseBackend(v_head_dim=4)
     sparse_impl = SimpleNamespace(calls=[])
-    backend = RTPSparseMlaBackend(
+    backend = rtp_sparse_mla_backend.RTPSparseMlaBackend(
         dense_backend=dense_backend,
         sparse_impl=sparse_impl,
         v_head_dim=4,
@@ -569,20 +567,22 @@ def test_default_sparse_wrapper_validates_topk_but_falls_back_to_dense(monkeypat
     positions = torch.arange(2)
     topk = torch.tensor([[1, 0], [0, 1]], dtype=torch.int32)
 
-    output = backend.forward(
-        q,
-        compressed_kv,
-        k_pe,
-        kv_cache="cache",
-        layer_id=9,
-        topk_indices=topk,
-        positions=positions,
-    )
+    try:
+        backend.forward(
+            q,
+            compressed_kv,
+            k_pe,
+            kv_cache="cache",
+            layer_id=9,
+            topk_indices=topk,
+            positions=positions,
+        )
+    except rtp_sparse_mla_backend._SparseUnavailable:
+        pass
+    else:
+        raise AssertionError("default sparse mock must not silently fallback to dense")
 
-    assert output.shape == (2, 1, 4)
-    assert len(dense_backend.calls) == 1
-    assert dense_backend.calls[0]["topk_indices"] is topk
-    assert dense_backend.calls[0]["positions"] is positions
+    assert dense_backend.calls == []
     assert sparse_impl.calls == []
 
 
