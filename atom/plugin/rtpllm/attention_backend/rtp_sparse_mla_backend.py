@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import inspect
-import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
+
+from atom.utils.custom_register import direct_register_custom_op
 
 
 class _SparseUnavailable(RuntimeError):
@@ -95,6 +96,8 @@ class _RealSparseMlaImpl:
         )
         self._absorbed_weights: _AbsorbedWeights | None = None
         self._cache_write_scale: dict[torch.device, torch.Tensor] = {}
+        self._cg_sparse_bufs: dict[str, torch.Tensor] | None = None
+        self._cg_workspace_signature: tuple[Any, ...] | None = None
 
     @staticmethod
     def _unwrap_linear_output(value: Any) -> torch.Tensor:
@@ -105,10 +108,26 @@ class _RealSparseMlaImpl:
         return value
 
     def _infer_num_heads(self, q: torch.Tensor) -> int:
-        if self.num_heads > 0:
-            return self.num_heads
-        self.num_heads = int(q.shape[1])
-        return self.num_heads
+        num_heads = int(q.shape[1])
+        if self.num_heads != num_heads:
+            self.num_heads = num_heads
+        return num_heads
+
+    def _infer_num_heads_from_weight(self, fallback: int) -> int:
+        try:
+            weight = self._read_kv_b_proj_weight()
+        except Exception:
+            return int(fallback)
+        per_head_dim = int(self.qk_nope_head_dim + self.v_head_dim)
+        if per_head_dim <= 0 or weight.ndim != 2:
+            return int(fallback)
+        for dim in weight.shape:
+            dim_i = int(dim)
+            if dim_i > 0 and dim_i % per_head_dim == 0:
+                candidate = dim_i // per_head_dim
+                if candidate > 0:
+                    return max(int(fallback), int(candidate))
+        return int(fallback)
 
     def _read_kv_b_proj_weight(self) -> torch.Tensor:
         if self.kv_b_proj is None:
@@ -188,10 +207,44 @@ class _RealSparseMlaImpl:
                 f"(positions={None if positions is None else int(positions.numel())}, "
                 f"tokens={int(q.shape[0])})."
             )
-        q_rope = q.clone()
-        k_pe_rope = k_pe.clone()
+        in_capture = torch.cuda.is_current_stream_capturing()
+        if in_capture:
+            if self._cg_sparse_bufs is None:
+                raise _SparseUnavailable("GLM5 RTP sparse MLA capture requires RoPE buffers.")
+            if positions.device != q.device or positions.dtype != torch.long:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires int64 positions on device."
+                )
+            if not positions.is_contiguous():
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires contiguous positions."
+                )
+            q_rope = self._cg_sparse_bufs["q_rope"][: q.shape[0], : q.shape[1], : q.shape[2]]
+            q_rope.copy_(q)
+            if k_pe.dim() == 2:
+                k_pe_rope = self._cg_sparse_bufs["k_pe_rope_2d"][
+                    : k_pe.shape[0], : k_pe.shape[1]
+                ]
+            elif k_pe.dim() == 3 and int(k_pe.shape[1]) == 1:
+                k_pe_rope = self._cg_sparse_bufs["k_pe_rope_3d"][
+                    : k_pe.shape[0], : k_pe.shape[1], : k_pe.shape[2]
+                ]
+            elif k_pe.dim() == 3:
+                k_pe_rope = self._cg_sparse_bufs["k_pe_rope_heads"][
+                    : k_pe.shape[0], : k_pe.shape[1], : k_pe.shape[2]
+                ]
+            else:
+                raise _SparseUnavailable(
+                    f"GLM5 RTP sparse MLA capture got invalid k_pe ndim={k_pe.dim()}."
+                )
+            k_pe_rope.copy_(k_pe)
+            rope_positions = positions.view(-1)
+        else:
+            q_rope = q.clone()
+            k_pe_rope = k_pe.clone()
+            rope_positions = positions.reshape(-1).to(device=q.device, dtype=torch.long)
         rotated_q_pe, rotated_k_pe = self.rotary_emb(
-            positions.to(device=q.device, dtype=torch.long),
+            rope_positions,
             q_rope[..., -rope_dim:],
             k_pe_rope,
         )
@@ -212,9 +265,6 @@ class _RealSparseMlaImpl:
         }
         if kv_cache_base.dtype not in fp8_dtypes:
             return "auto"
-        explicit = os.getenv("ATOM_RTP_MLA_FP8_CACHE_DTYPE", "").strip()
-        if explicit:
-            return explicit
         return "fp8_model1_mla" if self.kv_lora_rank == 448 else "fp8_ds_mla"
 
     def _write_current_to_cache(
@@ -243,12 +293,23 @@ class _RealSparseMlaImpl:
         if scale is None:
             scale = torch.tensor(1.0, dtype=torch.float32, device=compressed_kv.device)
             self._cache_write_scale[compressed_kv.device] = scale
+        in_capture = torch.cuda.is_current_stream_capturing()
+        if in_capture:
+            if slot_mapping.device != compressed_kv.device or slot_mapping.dtype != torch.int64:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires int64 slot_mapping on device."
+                )
+            slot_mapping_for_cache = slot_mapping
+        else:
+            slot_mapping_for_cache = slot_mapping.to(
+                device=compressed_kv.device, dtype=torch.int64
+            )
         try:
             concat_and_cache_mla(
                 compressed_kv,
                 k_pe,
                 kv_cache_base,
-                slot_mapping.to(device=compressed_kv.device, dtype=torch.int64),
+                slot_mapping_for_cache,
                 kv_cache_dtype=self._cache_dtype_name(kv_cache_base),
                 scale=scale,
             )
@@ -390,6 +451,136 @@ class _RealSparseMlaImpl:
             return dtypes.d_dtypes["fp16"]
         return dtypes.d_dtypes["bf16"]
 
+    @staticmethod
+    def _aiter_dtype_for_torch_dtype(dtype: torch.dtype, *, assume_fp8: bool = False) -> Any:
+        try:
+            from aiter import dtypes
+        except Exception as exc:
+            raise _SparseUnavailable(f"aiter dtypes unavailable: {exc}") from exc
+        if assume_fp8:
+            return dtypes.fp8
+        if dtype == torch.float16:
+            return dtypes.d_dtypes["fp16"]
+        return dtypes.d_dtypes["bf16"]
+
+    def _resolve_topk_for_prewarm(self) -> int:
+        for obj, attr in (
+            (getattr(self.mla_modules, "indexer", None), "index_topk"),
+            (getattr(self.mla_modules, "indexer", None), "topk_tokens"),
+            (self.mla_modules, "index_topk"),
+            (getattr(self.mla_modules, "config", None), "index_topk"),
+        ):
+            value = getattr(obj, attr, None) if obj is not None else None
+            if value is not None:
+                return int(value)
+        return 2048
+
+    def prewarm_for_cuda_graph(
+        self,
+        *,
+        max_num_tokens: int,
+        max_seq_len: int,
+        query_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        del max_seq_len
+        try:
+            from aiter import get_mla_metadata_info_v1
+        except Exception as exc:
+            raise _SparseUnavailable(f"aiter metadata prewarm unavailable: {exc}") from exc
+
+        max_tokens = int(max_num_tokens)
+        if max_tokens <= 0:
+            return
+        num_heads = int(self.num_heads or getattr(self.mla_modules, "num_local_heads", 0) or 0)
+        if num_heads <= 0:
+            # Lazily inferred in eager path; graph capture needs a stable budget.
+            num_heads = int(getattr(self.mla_modules, "num_heads", 0) or 1)
+        num_heads = self._infer_num_heads_from_weight(num_heads)
+        self.num_heads = num_heads
+        padded_num_heads = max(num_heads, 16)
+        if padded_num_heads % num_heads != 0:
+            padded_num_heads = ((padded_num_heads + num_heads - 1) // num_heads) * num_heads
+        topk = self._resolve_topk_for_prewarm()
+        latent_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        q_dtype = self._aiter_dtype_for_torch_dtype(query_dtype)
+        kv_dtype = self._aiter_dtype_for_torch_dtype(query_dtype, assume_fp8=True)
+        (
+            (work_meta_data_size, work_meta_data_type),
+            (work_indptr_size, work_indptr_type),
+            (work_info_set_size, work_info_set_type),
+            (reduce_indptr_size, reduce_indptr_type),
+            (reduce_final_map_size, reduce_final_map_type),
+            (reduce_partial_map_size, reduce_partial_map_type),
+        ) = get_mla_metadata_info_v1(
+            max(max_tokens, 1),
+            1,
+            padded_num_heads,
+            q_dtype,
+            kv_dtype,
+            is_sparse=True,
+            fast_mode=True,
+        )
+        self._cg_sparse_bufs = {
+            "qo_indptr": torch.arange(max_tokens + 1, device=device, dtype=torch.int32),
+            "sparse_seqlen": torch.empty(max_tokens, device=device, dtype=torch.int32),
+            "paged_kv_indptr": torch.empty(max_tokens + 1, device=device, dtype=torch.int32),
+            "paged_kv_last_page_len": torch.ones(max_tokens, device=device, dtype=torch.int32),
+            "paged_kv_indices": torch.empty(max_tokens * topk, device=device, dtype=torch.int32),
+            "q_rope": torch.empty(
+                max_tokens,
+                num_heads,
+                self.qk_nope_head_dim + self.qk_rope_head_dim,
+                device=device,
+                dtype=query_dtype,
+            ),
+            "k_pe_rope_2d": torch.empty(
+                max_tokens, self.qk_rope_head_dim, device=device, dtype=query_dtype
+            ),
+            "k_pe_rope_3d": torch.empty(
+                max_tokens, 1, self.qk_rope_head_dim, device=device, dtype=query_dtype
+            ),
+            "k_pe_rope_heads": torch.empty(
+                max_tokens, num_heads, self.qk_rope_head_dim, device=device, dtype=query_dtype
+            ),
+            "q_latent_nope_t": torch.empty(
+                num_heads, max_tokens, self.kv_lora_rank, device=device, dtype=query_dtype
+            ),
+            "q_latent": torch.empty(
+                max_tokens, num_heads, latent_dim, device=device, dtype=query_dtype
+            ),
+            "q_for_kernel": torch.empty(
+                max_tokens, padded_num_heads, latent_dim, device=device, dtype=query_dtype
+            ),
+            "latent_output": torch.empty(
+                max_tokens, padded_num_heads, self.kv_lora_rank, device=device, dtype=query_dtype
+            ),
+            "final_output_t": torch.empty(
+                num_heads, max_tokens, self.v_head_dim, device=device, dtype=query_dtype
+            ),
+            "work_meta_data": torch.empty(work_meta_data_size, dtype=work_meta_data_type, device=device),
+            "work_indptr": torch.empty(work_indptr_size, dtype=work_indptr_type, device=device),
+            "work_info_set": torch.empty(work_info_set_size, dtype=work_info_set_type, device=device),
+            "reduce_indptr": torch.empty(reduce_indptr_size, dtype=reduce_indptr_type, device=device),
+            "reduce_final_map": torch.empty(
+                reduce_final_map_size, dtype=reduce_final_map_type, device=device
+            ),
+            "reduce_partial_map": torch.empty(
+                reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
+            ),
+        }
+        self._cg_sparse_bufs["paged_kv_indptr"].zero_()
+        self._cache_write_scale[device] = torch.tensor(
+            1.0, dtype=torch.float32, device=device
+        )
+        self._cg_workspace_signature = (
+            max_tokens,
+            padded_num_heads,
+            topk,
+            query_dtype,
+            device,
+        )
+
     def _build_atom_sparse_metadata(
         self,
         *,
@@ -399,8 +590,6 @@ class _RealSparseMlaImpl:
         attn_metadata: Any,
         block_size: int,
     ) -> _AtomSparseMetadata:
-        if torch.cuda.is_current_stream_capturing():
-            raise _SparseUnavailable("ATOM sparse MLA metadata is not graph-capture safe yet.")
         try:
             from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
             from atom.plugin.attention_mla_sparse import (
@@ -418,13 +607,22 @@ class _RealSparseMlaImpl:
         num_heads = int(q_latent.shape[1])
         topk = int(topk_indices.shape[1])
         device = q_latent.device
+        in_capture = torch.cuda.is_current_stream_capturing()
+        cg_bufs = getattr(plugin_metadata, "cg_bufs", None)
+        sparse_bufs = self._cg_sparse_bufs
 
         query_start_loc = getattr(plugin_metadata, "query_start_loc", None)
         if query_start_loc is None:
             query_start_loc = getattr(plugin_metadata, "rtp_cu_seqlens_q", None)
         if not isinstance(query_start_loc, torch.Tensor) or int(query_start_loc.numel()) < 2:
             raise _SparseUnavailable("GLM5 RTP sparse MLA requires query_start_loc.")
-        query_start_loc = query_start_loc.to(device=device, dtype=torch.int32).contiguous()
+        if in_capture:
+            if query_start_loc.device != device or query_start_loc.dtype != torch.int32:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires int32 query_start_loc on device."
+                )
+        else:
+            query_start_loc = query_start_loc.to(device=device, dtype=torch.int32).contiguous()
 
         seq_lens = getattr(plugin_metadata, "seq_lens", None)
         if seq_lens is None:
@@ -433,38 +631,87 @@ class _RealSparseMlaImpl:
             query_start_loc.numel()
         ):
             raise _SparseUnavailable("GLM5 RTP sparse MLA requires seq_lens per request.")
-        seq_lens = seq_lens.to(device=device, dtype=torch.int32).contiguous()
-
-        req_id = self._build_req_id_per_token(attn_metadata, num_tokens, device).to(
-            dtype=torch.int32
-        )
-        block_table = self._block_table(attn_metadata, device).to(dtype=torch.int32)
-        topk_indices_i32 = topk_indices.to(device=device, dtype=torch.int32).contiguous()
-        query_lens = (query_start_loc[1:] - query_start_loc[:-1]).contiguous()
-
-        if device.type == "cpu":
-            sparse_seqlen = self._generate_sparse_seqlen_torch(
-                query_lens=query_lens,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                topk=topk,
-                num_tokens=num_tokens,
-            )
+        if in_capture:
+            if seq_lens.device != device or seq_lens.dtype != torch.int32:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires int32 seq_lens on device."
+                )
         else:
-            sparse_seqlen = generate_sparse_seqlen_triton(
-                query_lens,
-                seq_lens,
-                query_start_loc,
-                topk,
-                num_tokens,
-                int(torch.max(query_lens).detach().cpu().item()) if num_tokens else 1,
+            seq_lens = seq_lens.to(device=device, dtype=torch.int32).contiguous()
+
+        if in_capture:
+            if not isinstance(cg_bufs, dict) or sparse_bufs is None:
+                raise _SparseUnavailable("GLM5 RTP sparse MLA capture requires prewarmed buffers.")
+            req_id = cg_bufs.get("seq_id_i32", None)
+            if not isinstance(req_id, torch.Tensor):
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires prewarmed seq_id_i32."
+                )
+            req_id = req_id[:num_tokens]
+            block_table = getattr(plugin_metadata, "block_table", None)
+            if not isinstance(block_table, torch.Tensor):
+                raise _SparseUnavailable("GLM5 RTP sparse MLA capture requires block_table.")
+            if block_table.device != device or block_table.dtype != torch.int32:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires int32 block_table on device."
+                )
+            topk_indices_i32 = topk_indices
+            if topk_indices_i32.device != device or topk_indices_i32.dtype != torch.int32:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires int32 topk_indices on device."
+                )
+            if not topk_indices_i32.is_contiguous():
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires contiguous topk_indices."
+                )
+            sparse_seqlen = sparse_bufs["sparse_seqlen"][:num_tokens]
+            torch.clamp(seq_lens[:num_tokens], min=0, max=topk, out=sparse_seqlen)
+            max_query_len_for_sparse = 1
+        else:
+            req_id = self._build_req_id_per_token(attn_metadata, num_tokens, device).to(
+                dtype=torch.int32
+            )
+            block_table = self._block_table(attn_metadata, device).to(dtype=torch.int32)
+            topk_indices_i32 = topk_indices.to(device=device, dtype=torch.int32).contiguous()
+            query_lens = (query_start_loc[1:] - query_start_loc[:-1]).contiguous()
+            max_query_len_for_sparse = (
+                int(torch.max(query_lens).detach().cpu().item()) if num_tokens else 1
             )
 
-        qo_indptr = torch.arange(num_tokens + 1, device=device, dtype=torch.int32)
-        paged_kv_indptr = torch.zeros((num_tokens + 1,), device=device, dtype=torch.int32)
+            if device.type == "cpu":
+                sparse_seqlen = self._generate_sparse_seqlen_torch(
+                    query_lens=query_lens,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    topk=topk,
+                    num_tokens=num_tokens,
+                )
+            else:
+                sparse_seqlen = generate_sparse_seqlen_triton(
+                    query_lens,
+                    seq_lens,
+                    query_start_loc,
+                    topk,
+                    num_tokens,
+                    max_query_len_for_sparse,
+                )
+
+        if in_capture:
+            qo_indptr = sparse_bufs["qo_indptr"][: num_tokens + 1]
+            paged_kv_indptr = sparse_bufs["paged_kv_indptr"][: num_tokens + 1]
+            paged_kv_indptr[0].zero_()
+            paged_kv_last_page_len = sparse_bufs["paged_kv_last_page_len"][:num_tokens]
+            if int(sparse_bufs["paged_kv_indices"].numel()) < num_tokens * topk:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture paged_kv_indices buffer is too small."
+                )
+            paged_kv_indices = sparse_bufs["paged_kv_indices"][: num_tokens * topk]
+        else:
+            qo_indptr = torch.arange(num_tokens + 1, device=device, dtype=torch.int32)
+            paged_kv_indptr = torch.zeros((num_tokens + 1,), device=device, dtype=torch.int32)
+            paged_kv_last_page_len = torch.ones((num_tokens,), device=device, dtype=torch.int32)
+            paged_kv_indices = torch.zeros((num_tokens * topk,), device=device, dtype=torch.int32)
         torch.cumsum(sparse_seqlen, dim=0, out=paged_kv_indptr[1:])
-        paged_kv_last_page_len = torch.ones((num_tokens,), device=device, dtype=torch.int32)
-        paged_kv_indices = torch.zeros((num_tokens * topk,), device=device, dtype=torch.int32)
 
         triton_convert_req_index_to_global_index(
             req_id,
@@ -482,32 +729,40 @@ class _RealSparseMlaImpl:
         head_repeat_factor = padded_num_heads // num_heads
         q_dtype = self._aiter_dtype_for_tensor(q_latent)
         kv_dtype = self._aiter_dtype_for_tensor(kv_cache_base)
-        (
-            (work_meta_data_size, work_meta_data_type),
-            (work_indptr_size, work_indptr_type),
-            (work_info_set_size, work_info_set_type),
-            (reduce_indptr_size, reduce_indptr_type),
-            (reduce_final_map_size, reduce_final_map_type),
-            (reduce_partial_map_size, reduce_partial_map_type),
-        ) = get_mla_metadata_info_v1(
-            max(num_tokens, 1),
-            1,
-            padded_num_heads,
-            q_dtype,
-            kv_dtype,
-            is_sparse=True,
-            fast_mode=True,
-        )
-        work_meta_data = torch.empty(work_meta_data_size, dtype=work_meta_data_type, device=device)
-        work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
-        work_info_set = torch.empty(work_info_set_size, dtype=work_info_set_type, device=device)
-        reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type, device=device)
-        reduce_final_map = torch.empty(
-            reduce_final_map_size, dtype=reduce_final_map_type, device=device
-        )
-        reduce_partial_map = torch.empty(
-            reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
-        )
+        if in_capture:
+            work_meta_data = sparse_bufs["work_meta_data"]
+            work_indptr = sparse_bufs["work_indptr"]
+            work_info_set = sparse_bufs["work_info_set"]
+            reduce_indptr = sparse_bufs["reduce_indptr"]
+            reduce_final_map = sparse_bufs["reduce_final_map"]
+            reduce_partial_map = sparse_bufs["reduce_partial_map"]
+        else:
+            (
+                (work_meta_data_size, work_meta_data_type),
+                (work_indptr_size, work_indptr_type),
+                (work_info_set_size, work_info_set_type),
+                (reduce_indptr_size, reduce_indptr_type),
+                (reduce_final_map_size, reduce_final_map_type),
+                (reduce_partial_map_size, reduce_partial_map_type),
+            ) = get_mla_metadata_info_v1(
+                max(num_tokens, 1),
+                1,
+                padded_num_heads,
+                q_dtype,
+                kv_dtype,
+                is_sparse=True,
+                fast_mode=True,
+            )
+            work_meta_data = torch.empty(work_meta_data_size, dtype=work_meta_data_type, device=device)
+            work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
+            work_info_set = torch.empty(work_info_set_size, dtype=work_info_set_type, device=device)
+            reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type, device=device)
+            reduce_final_map = torch.empty(
+                reduce_final_map_size, dtype=reduce_final_map_type, device=device
+            )
+            reduce_partial_map = torch.empty(
+                reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
+            )
         get_mla_metadata_v1(
             qo_indptr,
             paged_kv_indptr,
@@ -523,8 +778,8 @@ class _RealSparseMlaImpl:
             reduce_partial_map,
             page_size=1,
             kv_granularity=16,
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
+            max_seqlen_qo=max_query_len_for_sparse,
+            uni_seqlen_qo=max_query_len_for_sparse,
             fast_mode=True,
             dtype_q=q_dtype,
             dtype_kv=kv_dtype,
@@ -553,9 +808,24 @@ class _RealSparseMlaImpl:
         attn_metadata: Any,
         block_size: int,
     ) -> torch.Tensor:
+        if torch.cuda.is_current_stream_capturing():
+            return self._run_aiter_sparse_decode(
+                q_latent=q_latent,
+                kv_cache_base=kv_cache_base,
+                topk_indices=topk_indices,
+                attn_metadata=attn_metadata,
+                block_size=block_size,
+            )
+        plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
+        is_prefill = bool(getattr(plugin_metadata, "num_prefills", 0) or 0)
         try:
             from flash_mla import flash_mla_sparse_fwd
         except Exception as exc:
+            if is_prefill:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA prefill requires flash_mla_sparse_fwd; "
+                    "refusing to run prefill through the decode kernel."
+                ) from exc
             return self._run_aiter_sparse_decode(
                 q_latent=q_latent,
                 kv_cache_base=kv_cache_base,
@@ -605,17 +875,32 @@ class _RealSparseMlaImpl:
             attn_metadata=attn_metadata,
             block_size=block_size,
         )
+        in_capture = torch.cuda.is_current_stream_capturing()
         if sparse_meta.head_repeat_factor > 1:
-            q_for_kernel = q_latent.repeat_interleave(
-                sparse_meta.head_repeat_factor, dim=1
-            )
+            if in_capture and self._cg_sparse_bufs is not None:
+                q_for_kernel = self._cg_sparse_bufs["q_for_kernel"][
+                    :num_tokens, : sparse_meta.padded_num_heads, :
+                ]
+                for repeat_idx in range(sparse_meta.head_repeat_factor):
+                    q_for_kernel[
+                        :, repeat_idx :: sparse_meta.head_repeat_factor, :
+                    ].copy_(q_latent)
+            else:
+                q_for_kernel = q_latent.repeat_interleave(
+                    sparse_meta.head_repeat_factor, dim=1
+                )
         else:
             q_for_kernel = q_latent
-        output = torch.empty(
-            (num_tokens, sparse_meta.padded_num_heads, self.kv_lora_rank),
-            dtype=q_for_kernel.dtype,
-            device=q_latent.device,
-        )
+        if in_capture and self._cg_sparse_bufs is not None:
+            output = self._cg_sparse_bufs["latent_output"][
+                :num_tokens, : sparse_meta.padded_num_heads, :
+            ]
+        else:
+            output = torch.empty(
+                (num_tokens, sparse_meta.padded_num_heads, self.kv_lora_rank),
+                dtype=q_for_kernel.dtype,
+                device=q_latent.device,
+            )
         try:
             kv_buffer = kv_cache_base.reshape(-1, 1, 1, latent_dim)
             mla_decode_fwd(
@@ -639,7 +924,9 @@ class _RealSparseMlaImpl:
         except Exception as exc:
             raise _SparseUnavailable(f"mla_decode_fwd failed: {exc}") from exc
         if sparse_meta.head_repeat_factor > 1:
-            output = output[:, :: sparse_meta.head_repeat_factor, :].contiguous()
+            output = output[:, :: sparse_meta.head_repeat_factor, :]
+            if not in_capture:
+                output = output.contiguous()
         return output
 
     def forward(
@@ -658,7 +945,7 @@ class _RealSparseMlaImpl:
         if attn_metadata is None:
             raise _SparseUnavailable("GLM5 RTP sparse MLA requires attn_metadata.")
         if getattr(getattr(attn_metadata, "plugin_metadata", None), "is_dummy_warmup", False):
-            raise _SparseUnavailable("GLM5 RTP sparse MLA skips dummy warmup.")
+            return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
         q_rope, k_pe_rope = self._apply_rope(q, k_pe, positions)
         kv_cache_base = self._write_current_to_cache(
             compressed_kv=compressed_kv,
@@ -669,17 +956,36 @@ class _RealSparseMlaImpl:
 
         absorbed = self._get_absorbed_weights(q_rope)
         q_nope = q_rope[..., : self.qk_nope_head_dim]
-        q_latent_nope = torch.bmm(
-            q_nope.transpose(0, 1).to(dtype=absorbed.w_kc.dtype),
-            absorbed.w_kc,
-        ).transpose(0, 1)
-        q_latent = torch.empty(
-            q.shape[0],
-            q.shape[1],
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            dtype=q_latent_nope.dtype,
-            device=q.device,
-        )
+        in_capture = torch.cuda.is_current_stream_capturing()
+        if in_capture:
+            if self._cg_sparse_bufs is None:
+                raise _SparseUnavailable("GLM5 RTP sparse MLA capture requires q buffers.")
+            if q_nope.dtype != absorbed.w_kc.dtype:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires q_nope dtype to match absorbed weights."
+                )
+            q_latent_nope_t = self._cg_sparse_bufs["q_latent_nope_t"][
+                : q.shape[1], : q.shape[0], :
+            ]
+            torch.bmm(q_nope.transpose(0, 1), absorbed.w_kc, out=q_latent_nope_t)
+            q_latent_nope = q_latent_nope_t.transpose(0, 1)
+            q_latent = self._cg_sparse_bufs["q_latent"][
+                : q.shape[0],
+                : q.shape[1],
+                : self.kv_lora_rank + self.qk_rope_head_dim,
+            ]
+        else:
+            q_latent_nope = torch.bmm(
+                q_nope.transpose(0, 1).to(dtype=absorbed.w_kc.dtype),
+                absorbed.w_kc,
+            ).transpose(0, 1)
+            q_latent = torch.empty(
+                q.shape[0],
+                q.shape[1],
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                dtype=q_latent_nope.dtype,
+                device=q.device,
+            )
         q_latent[..., : self.kv_lora_rank] = q_latent_nope
         if self.qk_rope_head_dim > 0:
             q_latent[..., self.kv_lora_rank :] = q_rope[
@@ -699,6 +1005,21 @@ class _RealSparseMlaImpl:
             attn_metadata=attn_metadata,
             block_size=block_size,
         )
+        if in_capture:
+            if latent_output.dtype != absorbed.w_vc.dtype:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires latent output dtype to match absorbed weights."
+                )
+            output_t = self._cg_sparse_bufs["final_output_t"][
+                : q.shape[1], : q.shape[0], :
+            ]
+            torch.bmm(latent_output.transpose(0, 1), absorbed.w_vc, out=output_t)
+            output = output_t.transpose(0, 1)
+            if output.dtype != q.dtype:
+                raise _SparseUnavailable(
+                    "GLM5 RTP sparse MLA capture requires final output dtype to match q."
+                )
+            return output
         output = torch.bmm(
             latent_output.transpose(0, 1).to(dtype=absorbed.w_vc.dtype),
             absorbed.w_vc,
@@ -751,6 +1072,34 @@ class RTPSparseMlaBackend:
             self.sparse_impl = _ContractSparseMlaImpl(self.v_head_dim)
             self._default_mock = True
 
+    def prepare_cuda_graph(self, attn_inputs) -> None:  # noqa: ANN001
+        del attn_inputs
+
+    def prewarm_for_cuda_graph(
+        self,
+        *,
+        max_num_tokens: int,
+        max_seq_len: int,
+        query_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        dense_prewarm = getattr(self.dense_backend, "prewarm_for_cuda_graph", None)
+        if callable(dense_prewarm):
+            dense_prewarm(
+                max_num_tokens=max_num_tokens,
+                max_seq_len=max_seq_len,
+                query_dtype=query_dtype,
+                device=device,
+            )
+        sparse_prewarm = getattr(self.sparse_impl, "prewarm_for_cuda_graph", None)
+        if callable(sparse_prewarm):
+            sparse_prewarm(
+                max_num_tokens=max_num_tokens,
+                max_seq_len=max_seq_len,
+                query_dtype=query_dtype,
+                device=device,
+            )
+
     @staticmethod
     def _get_attn_metadata() -> object:
         try:
@@ -776,24 +1125,6 @@ class RTPSparseMlaBackend:
                 "Expected topk_indices first dimension to match q tokens, "
                 f"got {topk_indices.shape[0]} and {q.shape[0]}"
             )
-
-    @staticmethod
-    def _enable_sparse_mock() -> bool:
-        return os.getenv("ATOM_RTP_ENABLE_SPARSE_MLA_MOCK", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-
-    @staticmethod
-    def _strict_sparse() -> bool:
-        return os.getenv("ATOM_RTP_SPARSE_MLA_STRICT", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
 
     @staticmethod
     def _impl_accepts_positions(impl: object) -> bool:
@@ -849,23 +1180,24 @@ class RTPSparseMlaBackend:
         topk_indices: Optional[torch.Tensor] = None,
         positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        attn_metadata = self._get_attn_metadata()
+        if getattr(getattr(attn_metadata, "plugin_metadata", None), "is_dummy_warmup", False):
+            return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
+
         if topk_indices is None:
             return self._dense_forward(
                 q, compressed_kv, k_pe, kv_cache, layer_id, None, positions
             )
 
         self._validate_topk_indices(q, topk_indices)
-        if (
-            (self._default_mock and not self._enable_sparse_mock())
-            or not callable(getattr(self.sparse_impl, "forward", None))
-        ):
-            return self._dense_forward(
-                q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices, positions
+        if self._default_mock or not callable(getattr(self.sparse_impl, "forward", None)):
+            raise _SparseUnavailable(
+                "GLM5 RTP sparse MLA is unavailable; refusing dense fallback."
             )
 
         kwargs = {
             "topk_indices": topk_indices,
-            "attn_metadata": self._get_attn_metadata(),
+            "attn_metadata": attn_metadata,
         }
         if self._impl_accepts_positions(self.sparse_impl):
             kwargs["positions"] = positions
@@ -879,8 +1211,121 @@ class RTPSparseMlaBackend:
                 **kwargs,
             )
         except _SparseUnavailable:
-            if self._strict_sparse():
-                raise
-            return self._dense_forward(
-                q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices, positions
-            )
+            plugin_metadata = getattr(attn_metadata, "plugin_metadata", None)
+            if bool(getattr(plugin_metadata, "num_prefills", 0) or 0):
+                return self._dense_forward(
+                    q, compressed_kv, k_pe, kv_cache, layer_id, topk_indices, positions
+                )
+            raise
+
+
+def rtp_sparse_attn_indexer(
+    hidden_states: torch.Tensor,
+    k_cache_prefix: str,
+    kv_cache: torch.Tensor,
+    q_input: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    quant_block_size: int,
+    scale_fmt: Optional[str],
+    topk_tokens: int,
+    head_dim: int,
+    max_model_len: int,
+    total_seq_lens: int,
+    topk_indices_buffer: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    k_norm_eps: float,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    weights_scale: float,
+    is_neox_style: bool,
+    use_qk_rope_cache_fusion: bool,
+) -> torch.Tensor:
+    from atom.models.deepseek_v2 import sparse_attn_indexer
+
+    return sparse_attn_indexer(
+        hidden_states,
+        k_cache_prefix,
+        kv_cache,
+        q_input,
+        k,
+        weights,
+        quant_block_size,
+        scale_fmt,
+        topk_tokens,
+        head_dim,
+        max_model_len,
+        total_seq_lens,
+        topk_indices_buffer,
+        k_norm_weight,
+        k_norm_bias,
+        k_norm_eps,
+        positions,
+        cos_cache,
+        sin_cache,
+        weights_scale,
+        is_neox_style,
+        use_qk_rope_cache_fusion,
+    )
+
+
+def rtp_sparse_attn_indexer_fake(
+    hidden_states: torch.Tensor,
+    k_cache_prefix: str,
+    kv_cache: torch.Tensor,
+    q_input: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    quant_block_size: int,
+    scale_fmt: Optional[str],
+    topk_tokens: int,
+    head_dim: int,
+    max_model_len: int,
+    total_seq_lens: int,
+    topk_indices_buffer: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    k_norm_eps: float,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    weights_scale: float,
+    is_neox_style: bool,
+    use_qk_rope_cache_fusion: bool,
+) -> torch.Tensor:
+    from atom.models.deepseek_v2 import sparse_attn_indexer_fake
+
+    return sparse_attn_indexer_fake(
+        hidden_states,
+        k_cache_prefix,
+        kv_cache,
+        q_input,
+        k,
+        weights,
+        quant_block_size,
+        scale_fmt,
+        topk_tokens,
+        head_dim,
+        max_model_len,
+        total_seq_lens,
+        topk_indices_buffer,
+        k_norm_weight,
+        k_norm_bias,
+        k_norm_eps,
+        positions,
+        cos_cache,
+        sin_cache,
+        weights_scale,
+        is_neox_style,
+        use_qk_rope_cache_fusion,
+    )
+
+
+direct_register_custom_op(
+    op_name="rtp_sparse_attn_indexer",
+    op_func=rtp_sparse_attn_indexer,
+    mutates_args=["topk_indices_buffer"],
+    fake_impl=rtp_sparse_attn_indexer_fake,
+)
