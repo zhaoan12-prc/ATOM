@@ -131,6 +131,30 @@ def test_constructor_injects_indexer_and_topk_indices_buffer_owner_path():
     assert attention.topk_indices_buffer is topk_buffer
 
 
+def test_constructor_swaps_indexer_to_rtp_sparse_indexer_op(monkeypatch):
+    default_op = object()
+    rtp_op = object()
+    monkeypatch.setattr(torch.ops.aiter, "rtp_sparse_attn_indexer", rtp_op, raising=False)
+    topk_buffer = torch.tensor([[4, 1, 3, 0]], dtype=torch.int32)
+    indexer = SimpleNamespace(
+        topk_indices_buffer=topk_buffer,
+        index_topk=4,
+        sparse_attn_indexer_impl=default_op,
+    )
+    modules = SimpleNamespace(
+        q_proj=object(),
+        o_proj=object(),
+        kv_b_proj=object(),
+        indexer=indexer,
+        v_head_dim=3,
+    )
+
+    attention = RTPMLAAttention(mla_modules=modules, dense_backend=object())
+
+    assert attention.indexer is indexer
+    assert indexer.sparse_attn_indexer_impl is rtp_op
+
+
 def _run_attention(attention, token_count: int):
     query = torch.empty(token_count, 6)
     compressed_kv = torch.empty(token_count, 8)
