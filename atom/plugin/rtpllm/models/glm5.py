@@ -708,7 +708,8 @@ class ATOMGlm5Moe(DeepSeekV2):
         if not self._is_external_plugin_mode():
             return super()._create_python_model()
 
-        import atom
+        from atom.plugin.rtpllm.attention_backend import apply_attention_mla_rtpllm_patch
+        from atom.plugin.prepare import prepare_model
         from atom.model_loader.loader import load_model_in_plugin_mode
 
         target_device = torch.device(
@@ -731,7 +732,9 @@ class ATOMGlm5Moe(DeepSeekV2):
             torch.set_default_dtype(target_dtype)
 
         try:
-            atom_model = atom.prepare_model(config=self, engine="rtpllm")
+            # Keep RTP-specific attention replacement confined to plugin loading.
+            apply_attention_mla_rtpllm_patch()
+            atom_model = prepare_model(config=self, engine="rtpllm")
             if atom_model is None:
                 raise ValueError("ATOM failed to create GLM5 model for rtp-llm plugin")
 

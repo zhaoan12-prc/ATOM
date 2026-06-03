@@ -592,10 +592,16 @@ class _RealSparseMlaImpl:
     ) -> _AtomSparseMetadata:
         try:
             from aiter import get_mla_metadata_info_v1, get_mla_metadata_v1
-            from atom.plugin.attention_mla_sparse import (
-                generate_sparse_seqlen_triton,
-                triton_convert_req_index_to_global_index,
-            )
+            try:
+                from atom.plugin.attention_mla_sparse import (
+                    generate_sparse_seqlen_triton,
+                    triton_convert_req_index_to_global_index,
+                )
+            except (ImportError, ModuleNotFoundError):
+                from atom.plugin.vllm.attention.layer_sparse_mla import (
+                    generate_sparse_seqlen_triton,
+                    triton_convert_req_index_to_global_index,
+                )
         except Exception as exc:
             raise _SparseUnavailable(f"ATOM sparse MLA metadata helpers unavailable: {exc}") from exc
 
@@ -1243,32 +1249,221 @@ def rtp_sparse_attn_indexer(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
 ) -> torch.Tensor:
-    from atom.models.deepseek_v2 import sparse_attn_indexer
+    from atom.models import deepseek_v2 as native
+    if not hasattr(native, "dtypes") and hasattr(native, "sparse_attn_indexer"):
+        return native.sparse_attn_indexer(
+            hidden_states,
+            k_cache_prefix,
+            kv_cache,
+            q_input,
+            k,
+            weights,
+            quant_block_size,
+            scale_fmt,
+            topk_tokens,
+            head_dim,
+            max_model_len,
+            total_seq_lens,
+            topk_indices_buffer,
+            k_norm_weight,
+            k_norm_bias,
+            k_norm_eps,
+            positions,
+            cos_cache,
+            sin_cache,
+            weights_scale,
+            is_neox_style,
+            use_qk_rope_cache_fusion,
+        )
 
-    return sparse_attn_indexer(
-        hidden_states,
-        k_cache_prefix,
-        kv_cache,
-        q_input,
-        k,
-        weights,
-        quant_block_size,
-        scale_fmt,
-        topk_tokens,
-        head_dim,
-        max_model_len,
-        total_seq_lens,
-        topk_indices_buffer,
-        k_norm_weight,
-        k_norm_bias,
-        k_norm_eps,
-        positions,
-        cos_cache,
-        sin_cache,
-        weights_scale,
-        is_neox_style,
-        use_qk_rope_cache_fusion,
+    del total_seq_lens
+
+    dtypes = native.dtypes
+    from atom.utils.forward_context import get_forward_context
+
+    forward_context = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    context = forward_context.context
+    if getattr(context, "is_dummy_run", False):
+        return torch.zeros_like(weights, dtype=torch.float32)
+
+    indexer = _resolve_rtp_indexer_from_k_cache_prefix(native, k_cache_prefix)
+    topk_indices = _resolve_rtp_topk_indices_buffer(
+        indexer=indexer,
+        fallback_buffer=topk_indices_buffer,
+        num_tokens=int(hidden_states.shape[0]),
+        topk_tokens=int(topk_tokens),
+        device=hidden_states.device,
+        in_capture=torch.cuda.is_current_stream_capturing(),
     )
+
+    slot_mapping = attn_metadata.slot_mapping
+    runner_block_size = native.get_current_atom_config().kv_cache_block_size
+    kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
+
+    if use_qk_rope_cache_fusion:
+        q_bf16 = q_input
+        q_fp8 = torch.empty_like(q_bf16, dtype=dtypes.fp8)
+        weights_out = torch.empty(
+            weights.shape, device=weights.device, dtype=torch.float32
+        )
+        native.indexer_qk_rope_quant_and_cache(
+            q_bf16,
+            q_fp8,
+            weights,
+            weights_out,
+            k,
+            kv_cache,
+            slot_mapping,
+            k_norm_weight,
+            k_norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            quant_block_size,
+            scale_fmt,
+            weights_scale,
+            preshuffle=True,
+            is_neox=is_neox_style,
+        )
+        weights = weights_out
+    else:
+        q_fp8 = q_input
+        native.indexer_k_quant_and_cache(
+            k,
+            kv_cache,
+            slot_mapping,
+            quant_block_size,
+            scale_fmt,
+            preshuffle=True,
+        )
+
+    if context.is_prefill:
+        if attn_metadata.max_seqlen_k <= topk_tokens:
+            return weights
+        prefill_metadata = attn_metadata
+        num_prefills = context.batch_size
+        total_kv = (
+            prefill_metadata.total_kv
+            if prefill_metadata.has_cached
+            else hidden_states.shape[0]
+        )
+        k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
+        k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
+        native.cp_gather_indexer_k_quant_cache(
+            kv_cache,
+            k_fp8,
+            k_scale.view(dtypes.fp8),
+            prefill_metadata.block_tables,
+            (
+                prefill_metadata.cu_seqlens_k
+                if prefill_metadata.has_cached
+                else prefill_metadata.cu_seqlens_q
+            ),
+            preshuffle=True,
+        )
+        cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
+        cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
+        num_tokens = hidden_states.shape[0]
+        num_decode_tokens = 0
+        logits = native.fp8_mqa_logits(
+            Q=q_fp8[num_decode_tokens:num_tokens],
+            KV=k_fp8,
+            kv_scales=k_scale,
+            weights=weights[num_decode_tokens:num_tokens],
+            cu_starts=cu_seqlen_ks,
+            cu_ends=cu_seqlen_ke,
+        )
+        native.top_k_per_row_prefill(
+            logits=logits,
+            rowStarts=cu_seqlen_ks,
+            rowEnds=cu_seqlen_ke,
+            indices=topk_indices[num_decode_tokens:num_tokens, :topk_tokens],
+            values=None,
+            numRows=logits.shape[0],
+            stride0=logits.stride(0),
+            stride1=logits.stride(1),
+        )
+    else:
+        num_decode_tokens = (
+            context.batch_size * attn_metadata.max_seqlen_q
+        )
+        kv_cache = kv_cache.unsqueeze(-2)
+        padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
+            context.batch_size, -1, *q_fp8.shape[1:]
+        )
+        batch_size, next_n, _, _ = padded_q_fp8_decode_tokens.shape
+        logits = torch.empty(
+            [batch_size * next_n, max_model_len], dtype=torch.float32, device="cuda"
+        )
+        native.deepgemm_fp8_paged_mqa_logits(
+            padded_q_fp8_decode_tokens,
+            kv_cache,
+            weights[:num_decode_tokens],
+            logits,
+            attn_metadata.context_lens,
+            attn_metadata.block_tables,
+            max_model_len,
+            KVBlockSize=runner_block_size,
+            Preshuffle=True,
+        )
+        native.top_k_per_row_decode(
+            logits,
+            next_n,
+            attn_metadata.context_lens,
+            topk_indices[:num_decode_tokens, :topk_tokens],
+            logits.shape[0],
+            logits.stride(0),
+            logits.stride(1),
+        )
+    return weights
+
+
+def _resolve_rtp_indexer_from_k_cache_prefix(native: Any, k_cache_prefix: str) -> Any:
+    prefix = (
+        k_cache_prefix[: -len(".k_cache")]
+        if isinstance(k_cache_prefix, str) and k_cache_prefix.endswith(".k_cache")
+        else k_cache_prefix
+    )
+    try:
+        return native.get_current_atom_config().compilation_config.static_forward_context.get(
+            prefix
+        )
+    except Exception:
+        return None
+
+
+def _resolve_rtp_topk_indices_buffer(
+    *,
+    indexer: Any,
+    fallback_buffer: torch.Tensor,
+    num_tokens: int,
+    topk_tokens: int,
+    device: torch.device,
+    in_capture: bool,
+) -> torch.Tensor:
+    buffer = getattr(indexer, "topk_indices_buffer", None) if indexer is not None else None
+    if (
+        isinstance(buffer, torch.Tensor)
+        and buffer.ndim == 2
+        and int(buffer.shape[0]) >= num_tokens
+        and int(buffer.shape[1]) >= topk_tokens
+    ):
+        topk_indices = buffer[:num_tokens, :topk_tokens]
+    elif in_capture:
+        raise RuntimeError(
+            "RTP GLM5 cuda-graph capture requires prewarmed topk_indices_buffer "
+            f"with shape >= ({num_tokens}, {topk_tokens})."
+        )
+    else:
+        topk_indices = torch.empty(
+            (num_tokens, topk_tokens), dtype=torch.int32, device=device
+        )
+
+    if indexer is not None:
+        indexer._rtp_last_topk_indices = topk_indices
+    return topk_indices
 
 
 def rtp_sparse_attn_indexer_fake(

@@ -73,6 +73,7 @@ class RTPDenseMlaBackend:
 
     @staticmethod
     def _get_metadata(num_tokens: int, device: torch.device) -> _DenseMlaMetadata:
+        in_capture = torch.cuda.is_current_stream_capturing()
         attn_metadata = None
         context = None
         rtp_seq_size_per_block = 0
@@ -119,14 +120,34 @@ class RTPDenseMlaBackend:
             and int(seq_lens.numel()) == num_tokens
             and isinstance(block_table, torch.Tensor)
             and isinstance(slot_mapping, torch.Tensor)
+            and not in_capture
         ):
             query_start_loc = torch.arange(
                 num_tokens + 1, dtype=torch.int64, device=device
             )
 
         if query_start_loc is not None and int(query_start_loc.numel()) >= 2:
+            if in_capture:
+                if query_start_loc.device != device or query_start_loc.dtype != torch.int64:
+                    raise RuntimeError(
+                        "GLM5 RTP dense MLA capture requires prebuilt int64 "
+                        "query_start_loc on the target device."
+                    )
+                is_prefill = RTPDenseMlaBackend._read_is_prefill(context)
+                return _DenseMlaMetadata(
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens if isinstance(seq_lens, torch.Tensor) else None,
+                    block_table=block_table if isinstance(block_table, torch.Tensor) else None,
+                    slot_mapping=slot_mapping if isinstance(slot_mapping, torch.Tensor) else None,
+                    is_prefill=is_prefill,
+                    block_size=max(1, rtp_seq_size_per_block),
+                )
+
             query_start_loc = query_start_loc.to(device=device, dtype=torch.int64)
-            if int(query_start_loc[0].item()) == 0 and int(query_start_loc[-1].item()) == num_tokens:
+            if (
+                int(query_start_loc[0].item()) == 0
+                and int(query_start_loc[-1].item()) == num_tokens
+            ):
                 is_prefill = RTPDenseMlaBackend._read_is_prefill(context)
                 return _DenseMlaMetadata(
                     query_start_loc=query_start_loc,
@@ -154,6 +175,11 @@ class RTPDenseMlaBackend:
                 f"multi-token batches (num_tokens={num_tokens})."
             )
         is_prefill = RTPDenseMlaBackend._read_is_prefill(context)
+        if in_capture:
+            raise RuntimeError(
+                "GLM5 RTP dense MLA capture requires query_start_loc metadata; "
+                "fallback tensor allocation is disabled during capture."
+            )
         return _DenseMlaMetadata(
             query_start_loc=torch.tensor([0, num_tokens], dtype=torch.int64, device=device),
             seq_lens=None,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from typing import Optional
 
 import torch
@@ -21,15 +22,19 @@ def _resolve_index_topk(attn) -> int:
     raise AttributeError("GLM5 RTP MLA M1 indexer requires index_topk/topk_tokens")
 
 
-def _get_topk_indices_buffer(attn) -> torch.Tensor:
+def _get_topk_indices_buffer(attn) -> Optional[torch.Tensor]:
     indexer = getattr(attn, "indexer", None)
-    buffer = getattr(indexer, "topk_indices_buffer", None) if indexer is not None else None
+    buffer = (
+        getattr(indexer, "_rtp_last_topk_indices", None)
+        if indexer is not None
+        else None
+    )
+    if buffer is None and indexer is not None:
+        buffer = getattr(indexer, "topk_indices_buffer", None)
     if buffer is None:
         buffer = getattr(attn, "topk_indices_buffer", None)
     if buffer is None:
         buffer = getattr(attn, "_topk_indices_buffer", None)
-    if buffer is None:
-        raise AttributeError("GLM5 RTP MLA M1 indexer requires topk_indices_buffer")
     return buffer
 
 
@@ -48,10 +53,10 @@ def _should_emit_topk_indices(attn) -> bool:
     if getattr(context, "is_prefill", False) and attn_metadata is not None:
         max_seqlen_k = getattr(attn_metadata, "max_seqlen_k", None)
         if max_seqlen_k is not None:
-            try:
-                return int(max_seqlen_k) > _get_topk_indices_buffer(attn).shape[1]
-            except AttributeError:
-                return True
+            buffer = _get_topk_indices_buffer(attn)
+            if buffer is None or buffer.ndim < 2:
+                return False
+            return int(max_seqlen_k) > buffer.shape[1]
     return True
 
 
@@ -59,7 +64,33 @@ def _use_rtp_sparse_attn_indexer(indexer: object | None) -> None:
     if indexer is None or not hasattr(indexer, "sparse_attn_indexer_impl"):
         return
     __import__("atom.plugin.rtpllm.attention_backend.rtp_sparse_mla_backend")
+    _ensure_rtp_topk_buffer(indexer)
     indexer.sparse_attn_indexer_impl = torch.ops.aiter.rtp_sparse_attn_indexer
+
+
+def _ensure_rtp_topk_buffer(indexer: object) -> None:
+    if isinstance(getattr(indexer, "topk_indices_buffer", None), torch.Tensor):
+        return
+    topk = getattr(indexer, "index_topk", None)
+    if topk is None:
+        topk = getattr(indexer, "topk_tokens", None)
+    if topk is None:
+        return
+    rows = max(1, int(os.environ.get("CONCURRENCY_LIMIT", "128") or 128))
+    existing = getattr(indexer, "topk_indices_buffer", None)
+    sparse_buffer = getattr(indexer, "sparse_kv_indices_buffer", None)
+    device = existing.device if isinstance(existing, torch.Tensor) else torch.device("cuda")
+    if not isinstance(existing, torch.Tensor) and isinstance(sparse_buffer, torch.Tensor):
+        device = sparse_buffer.device
+    if (
+        not isinstance(existing, torch.Tensor)
+        or existing.ndim < 2
+        or int(existing.shape[0]) < rows
+        or int(existing.shape[1]) < int(topk)
+    ):
+        indexer.topk_indices_buffer = torch.empty(
+            (rows, int(topk)), dtype=torch.int32, device=device
+        )
 
 
 class RTPMLAAttention:
@@ -158,7 +189,10 @@ class RTPMLAAttention:
         if not _should_emit_topk_indices(self):
             return None
         index_topk = _resolve_index_topk(self)
-        return _get_topk_indices_buffer(self)[: query.shape[0], :index_topk]
+        buffer = _get_topk_indices_buffer(self)
+        if buffer is None or buffer.ndim < 2 or buffer.numel() == 0:
+            return None
+        return buffer[: query.shape[0], :index_topk]
 
     def forward(
         self,
@@ -204,7 +238,15 @@ def apply_attention_mla_rtpllm_patch() -> None:
     """Switch ATOM's generic Attention symbol to the RTP MLA adapter."""
 
     import atom.model_ops as ops
+    import atom.model_ops.base_attention as base_attention
 
     ops.RTPMLAAttention = RTPMLAAttention
     ops.Attention = RTPMLAAttention
+    base_attention.Attention = RTPMLAAttention
+
+    try:
+        import atom.models.deepseek_v2 as deepseek_v2
+    except (ImportError, ModuleNotFoundError):
+        return
+    deepseek_v2.Attention = RTPMLAAttention
 

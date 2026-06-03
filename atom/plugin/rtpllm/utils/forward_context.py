@@ -16,15 +16,10 @@ except (ImportError, ModuleNotFoundError):
 
 from atom.config import KVCacheTensor, get_current_atom_config
 from atom.model_ops.attention_gdn import GatedDeltaNet
-from atom.model_ops.paged_attention import PagedAttention
+from atom.model_ops.paged_attention import Attention as PagedAttention
 from atom.model_ops.attentions.gdn_attn import (
     GDNAttentionMetadata,
     compute_causal_conv1d_metadata,
-)
-from atom.plugin.attention import (
-    AiterFlashAttentionDecodeMetadata,
-    AiterFlashAttentionMetadataForPluginMode,
-    AiterFlashAttentionPrefillMetadata,
 )
 from atom.utils.forward_context import (
     AttentionMetaData,
@@ -34,6 +29,42 @@ from atom.utils.forward_context import (
     set_forward_context,
     set_kv_cache_data,
 )
+
+
+@dataclass
+class AiterFlashAttentionPhaseMetadata:
+    max_query_len: int
+    max_seq_len: int
+    query_start_loc: torch.Tensor
+
+
+AiterFlashAttentionDecodeMetadata = AiterFlashAttentionPhaseMetadata
+AiterFlashAttentionPrefillMetadata = AiterFlashAttentionPhaseMetadata
+
+
+@dataclass
+class AiterFlashAttentionMetadataForPluginMode:
+    num_actual_tokens: int
+    num_actual_kv_tokens: int
+    max_query_len: int
+    query_start_loc: torch.Tensor
+    max_seq_len: int
+    seq_lens: torch.Tensor
+    slot_mapping: torch.Tensor
+    block_table: torch.Tensor
+    num_decodes: int
+    num_decode_tokens: int
+    num_prefills: int
+    num_prefill_tokens: int
+    num_extends: int
+    num_extend_tokens: int
+    decode_metadata: AiterFlashAttentionPhaseMetadata | None = None
+    prefill_metadata: AiterFlashAttentionPhaseMetadata | None = None
+    extend_metadata: Any = None
+    use_cascade: bool = False
+    common_prefix_len: int = 0
+    total_tokens: int = 0
+    context: Any = None
 
 
 if triton is not None:
@@ -1218,7 +1249,7 @@ class RTPForwardContext:
             plugin_md.rtp_has_prefix = bool((prefix_lengths > 0).any().item())
         else:
             plugin_md.rtp_has_prefix = False
-        return AttentionMetaData(
+        attn_metadata = AttentionMetaData(
             cu_seqlens_q=query_start_loc,
             cu_seqlens_k=query_start_loc,
             max_seqlen_q=max_query_len,
@@ -1230,8 +1261,9 @@ class RTPForwardContext:
             cu_seqlen_ke=cu_seqlen_ke,
             has_cached=False,
             total_kv=int(num_actual_kv_tokens),
-            plugin_metadata=plugin_md,
         )
+        attn_metadata.plugin_metadata = plugin_md
+        return attn_metadata
 
     @staticmethod
     def collect_layer_maps(model: Any) -> LayerMaps:
