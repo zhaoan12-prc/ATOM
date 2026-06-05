@@ -38,7 +38,7 @@ from atom.model_ops.fused_moe.mori_prepare_finalize import MoriPrepareAndFinaliz
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,
     is_rocm_aiter_fuse_routed_scaling_factor,
-    is_rocm_aiter_fusion_shared_expert_enabled,
+    is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
@@ -2026,6 +2026,7 @@ class FusedMoE(torch.nn.Module):
         activation: ActivationType = ActivationType.Silu,
         shared_expert_scoring_func: Optional[str] = None,
         config: Optional[PretrainedConfig] = None,
+        shared_expert_prefix: Optional[str] = None,
     ):
         super().__init__()
         self.prefix = prefix
@@ -2066,7 +2067,16 @@ class FusedMoE(torch.nn.Module):
         self.global_num_experts = num_experts
         self.shared_expert_scoring_func = shared_expert_scoring_func
 
-        fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
+        if shared_expert_prefix is None and prefix.endswith(".experts"):
+            shared_expert_prefix = prefix[: -len(".experts")] + ".shared_experts"
+
+        fuse_shared_experts = (
+            is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+                quant_config,
+                shared_expert_prefix=shared_expert_prefix,
+                routed_expert_prefix=prefix,
+            )
+        )
         self.num_fused_shared_experts = (
             config.n_shared_experts
             if config is not None
@@ -2989,10 +2999,7 @@ class FusedMoE(torch.nn.Module):
                 # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
                 # weights gathered from the unbiased sqrt(softplus(.)) values.
                 tokens_num = router_logits.shape[0]
-                fuse_shared = (
-                    is_rocm_aiter_fusion_shared_expert_enabled()
-                    and num_fused_shared_experts > 0
-                )
+                fuse_shared = num_fused_shared_experts > 0
                 if fuse_shared:
                     import atom.model_ops.topK as _topK_mod
 
