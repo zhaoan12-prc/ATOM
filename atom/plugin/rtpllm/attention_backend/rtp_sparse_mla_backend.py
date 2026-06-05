@@ -107,6 +107,9 @@ class _RealSparseMlaImpl:
         self._enable_sparse_validate = (
             os.getenv("ATOM_RTP_GLM5_SPARSE_VALIDATE", "0") == "1"
         )
+        self._enable_capture_metadata_reuse = (
+            os.getenv("ATOM_RTP_GLM5_SPARSE_CAPTURE_META_REUSE", "1") == "1"
+        )
 
     @staticmethod
     def _resolve_sparse_page_size() -> int:
@@ -996,6 +999,30 @@ class _RealSparseMlaImpl:
             reduce_partial_map = torch.empty(
                 reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
             )
+        capture_meta_sig = (
+            int(num_tokens),
+            int(topk),
+            int(padded_num_heads),
+            str(q_dtype),
+            str(kv_dtype),
+            str(device),
+        )
+        reuse_capture_metadata = False
+        if in_capture and self._enable_capture_metadata_reuse:
+            cached_capture_meta = getattr(
+                plugin_metadata, "_rtp_sparse_capture_meta_workspace", None
+            )
+            if (
+                isinstance(cached_capture_meta, dict)
+                and cached_capture_meta.get("signature") == capture_meta_sig
+            ):
+                work_meta_data = cached_capture_meta["work_meta_data"]
+                work_indptr = cached_capture_meta["work_indptr"]
+                work_info_set = cached_capture_meta["work_info_set"]
+                reduce_indptr = cached_capture_meta["reduce_indptr"]
+                reduce_final_map = cached_capture_meta["reduce_final_map"]
+                reduce_partial_map = cached_capture_meta["reduce_partial_map"]
+                reuse_capture_metadata = True
         requested_page_size = self._sparse_page_size
         kv_token_slots = self._kv_token_slot_capacity(kv_cache_base)
         page_size = requested_page_size
@@ -1042,27 +1069,38 @@ class _RealSparseMlaImpl:
                 max_slots=max_page_slots,
             )
 
-        get_mla_metadata_v1(
-            qo_indptr,
-            paged_kv_indptr,
-            paged_kv_last_page_len,
-            padded_num_heads,
-            1,
-            True,
-            work_meta_data,
-            work_info_set,
-            work_indptr,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            page_size=page_size,
-            kv_granularity=16,
-            max_seqlen_qo=max_query_len_for_sparse,
-            uni_seqlen_qo=max_query_len_for_sparse,
-            fast_mode=True,
-            dtype_q=q_dtype,
-            dtype_kv=kv_dtype,
-        )
+        if not reuse_capture_metadata:
+            get_mla_metadata_v1(
+                qo_indptr,
+                paged_kv_indptr,
+                paged_kv_last_page_len,
+                padded_num_heads,
+                1,
+                True,
+                work_meta_data,
+                work_info_set,
+                work_indptr,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                page_size=page_size,
+                kv_granularity=16,
+                max_seqlen_qo=max_query_len_for_sparse,
+                uni_seqlen_qo=max_query_len_for_sparse,
+                fast_mode=True,
+                dtype_q=q_dtype,
+                dtype_kv=kv_dtype,
+            )
+            if in_capture and self._enable_capture_metadata_reuse:
+                plugin_metadata._rtp_sparse_capture_meta_workspace = {
+                    "signature": capture_meta_sig,
+                    "work_meta_data": work_meta_data,
+                    "work_indptr": work_indptr,
+                    "work_info_set": work_info_set,
+                    "reduce_indptr": reduce_indptr,
+                    "reduce_final_map": reduce_final_map,
+                    "reduce_partial_map": reduce_partial_map,
+                }
         return _AtomSparseMetadata(
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
@@ -1128,13 +1166,19 @@ class _RealSparseMlaImpl:
                 q_for_kernel = self._cg_sparse_bufs["q_for_kernel"][
                     :num_tokens, : sparse_meta.padded_num_heads, :
                 ]
-                for repeat_idx in range(sparse_meta.head_repeat_factor):
-                    q_for_kernel[
-                        :, repeat_idx :: sparse_meta.head_repeat_factor, :
-                    ].copy_(q_latent)
+                # Capture path: use one broadcasted copy to fill repeated heads,
+                # avoiding per-repeat slice copies in the decode hot path.
+                q_for_kernel.view(
+                    num_tokens,
+                    num_heads,
+                    sparse_meta.head_repeat_factor,
+                    latent_dim,
+                ).copy_(q_latent.unsqueeze(2))
             else:
-                q_for_kernel = q_latent.repeat_interleave(
-                    sparse_meta.head_repeat_factor, dim=1
+                q_for_kernel = (
+                    q_latent.unsqueeze(2)
+                    .expand(-1, -1, sparse_meta.head_repeat_factor, -1)
+                    .reshape(num_tokens, sparse_meta.padded_num_heads, latent_dim)
                 )
         else:
             q_for_kernel = q_latent
