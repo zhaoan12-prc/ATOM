@@ -1,4 +1,3 @@
-from .rtp_dense_mla_backend import RTPDenseMlaBackend
 from .rtp_mla_attention import RTPMLAAttention, apply_attention_mla_rtpllm_patch
 from .rtp_mla_metadata import (
     GLM5_RTP_BRIDGE_MODE,
@@ -13,7 +12,9 @@ def __getattr__(name):
     if name in {"RTPAttention", "RTPFullAttention"}:
         from .rtp_full_attention import RTPAttention, RTPFullAttention
 
-        return {"RTPAttention": RTPAttention, "RTPFullAttention": RTPFullAttention}[name]
+        return {"RTPAttention": RTPAttention, "RTPFullAttention": RTPFullAttention}[
+            name
+        ]
     if name == "apply_attention_gdn_rtpllm_patch":
         from .attention_gdn import apply_attention_gdn_rtpllm_patch
 
@@ -24,10 +25,10 @@ def __getattr__(name):
         return apply_attention_mha_rtpllm_patch
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+
 __all__ = [
     "RTPAttention",
     "RTPFullAttention",
-    "RTPDenseMlaBackend",
     "RTPMLAAttention",
     "RTPSparseMlaBackend",
     "GLM5_RTP_BRIDGE_MODE",
