@@ -367,7 +367,11 @@ class _RealSparseMlaImpl:
         }
         if kv_cache_base.dtype not in fp8_dtypes:
             return "auto"
-        return "fp8_model1_mla" if self.kv_lora_rank == 448 else "fp8_ds_mla"
+        # This aiter build implements only the 576-byte/token single-scale MLA layout
+        # ("fp8"/"fp8_e4m3"); it has no "fp8_ds_mla"/"fp8_model1_mla" (656-byte
+        # interleaved-scale) path. The rtp-llm KV cache is allocated to match this 576
+        # layout (mla_use_aiter_fp8_layout), so write with "fp8".
+        return "fp8"
 
     def _write_current_to_cache(
         self,
@@ -1173,6 +1177,18 @@ class _RealSparseMlaImpl:
                 dtype=q_for_kernel.dtype,
                 device=q_latent.device,
             )
+        # The aiter fp8 MLA decode asm kernel (a16w8: bf16 query, fp8 kv) dereferences
+        # a kv dequant-scale pointer; passing kv_scale=None leaves it null and faults
+        # with "Memory access fault on address (nil)". The cache was written with
+        # concat_and_cache_mla(scale=1.0), so the dequant scale is 1.0.
+        kv_scale = None
+        if self._cache_dtype_name(kv_cache_base) == "fp8":
+            kv_scale = self._cache_write_scale.get(kv_cache_base.device)
+            if kv_scale is None:
+                kv_scale = torch.tensor(
+                    1.0, dtype=torch.float32, device=kv_cache_base.device
+                )
+                self._cache_write_scale[kv_cache_base.device] = kv_scale
         try:
             kv_buffer = kv_cache_base.reshape(-1, 1, 1, latent_dim)
             if (
@@ -1210,6 +1226,7 @@ class _RealSparseMlaImpl:
                 reduce_indptr=sparse_meta.reduce_indptr,
                 reduce_final_map=sparse_meta.reduce_final_map,
                 reduce_partial_map=sparse_meta.reduce_partial_map,
+                kv_scale=kv_scale,
             )
         except Exception as exc:
             raise _SparseUnavailable(f"mla_decode_fwd failed: {exc}") from exc

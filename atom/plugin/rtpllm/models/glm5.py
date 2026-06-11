@@ -577,6 +577,16 @@ class ATOMGlm5Moe(DeepSeekV2):
         modules = os.getenv("RTP_LLM_EXTERNAL_MODEL_PACKAGES", "")
         return "atom.plugin.rtpllm.models" in modules
 
+    @classmethod
+    def _create_config(cls, ckpt_path: str):
+        config = super()._create_config(ckpt_path)
+        # ATOM plugin consumes the FP8 MLA KV cache via aiter kernels
+        # (concat_and_cache_mla / mla_decode_fwd), which require the 576-byte/token
+        # aiter layout rather than rtp-llm's native 656-byte layout. Only the fp8
+        # branch is affected; bf16 MLA stays on the shared 576 layout.
+        config.attn_config.mla_use_aiter_fp8_layout = True
+        return config
+
     def support_cuda_graph(self) -> bool:
         if os.getenv("ENABLE_CUDA_GRAPH", "1") == "0":
             logger.info("ENABLE_CUDA_GRAPH=0 - ATOMGlm5Moe forces eager forward.")
