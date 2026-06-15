@@ -577,8 +577,8 @@ def test_real_sparse_decode_uses_atom_aiter_metadata(monkeypatch):
         ),
         v_head_dim=3,
     )
-    q_latent = torch.randn(2, 2, 5)
-    kv_cache = torch.randn(8, 1, 5)
+    q_latent = torch.randn(2, 2, 5, dtype=torch.bfloat16)
+    kv_cache = torch.empty(8, 1, 5, dtype=torch.uint8)
     topk = torch.tensor([[0, 1, 2], [0, 1, -1]], dtype=torch.int32)
     attn_metadata = SimpleNamespace(
         plugin_metadata=SimpleNamespace(
@@ -598,15 +598,38 @@ def test_real_sparse_decode_uses_atom_aiter_metadata(monkeypatch):
     )
 
     assert output.shape == (2, 2, 4)
+    assert output.dtype == torch.bfloat16
     assert torch.all(output == 3)
     decode_call = calls["mla_decode_fwd"]
     assert decode_call["q"].shape == (2, 16, 5)
+    assert decode_call["q"].dtype == aiter.dtypes.fp8
     assert decode_call["output"].shape == (2, 16, 4)
+    assert decode_call["output"].dtype == torch.bfloat16
     assert decode_call["paged_kv_indptr"].tolist() == [0, 3, 5]
     assert decode_call["paged_kv_indices"][:5].tolist() == [0, 1, 2, 4, 5]
     assert decode_call["kwargs"]["page_size"] == 1
+    assert decode_call["kwargs"]["q_scale"] is not None
+    assert decode_call["kwargs"]["kv_scale"] is not None
     assert decode_call["kwargs"]["work_meta_data"] is not None
     assert decode_call["kwargs"]["reduce_final_map"] is not None
+
+
+def test_real_sparse_cache_dtype_uses_aiter_fp8_layout():
+    module = importlib.import_module(_SPARSE_BACKEND_MODULE)
+    impl = module._RealSparseMlaImpl(
+        mla_modules=SimpleNamespace(
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            num_heads=2,
+            rotary_emb=None,
+            kv_b_proj=SimpleNamespace(weight=torch.empty(0)),
+        ),
+        v_head_dim=128,
+    )
+
+    assert impl._cache_dtype_name(torch.empty(1, 576, dtype=torch.uint8)) == "fp8"
+    assert impl._cache_dtype_name(torch.empty(1, 576, dtype=torch.bfloat16)) == "auto"
 
 
 def test_real_sparse_eager_metadata_workspace_skips_refill(monkeypatch):
