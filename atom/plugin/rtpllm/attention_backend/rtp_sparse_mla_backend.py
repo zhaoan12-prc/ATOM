@@ -367,7 +367,8 @@ class _RealSparseMlaImpl:
         }
         if kv_cache_base.dtype not in fp8_dtypes:
             return "auto"
-        return "fp8_model1_mla" if self.kv_lora_rank == 448 else "fp8_ds_mla"
+        # RTP allocates GLM5 FP8 MLA KV cache in the aiter 576-byte/token layout.
+        return "fp8"
 
     def _write_current_to_cache(
         self,
@@ -597,7 +598,7 @@ class _RealSparseMlaImpl:
     ) -> None:
         del max_seq_len
         try:
-            from aiter import get_mla_metadata_info_v1
+            from aiter import dtypes, get_mla_metadata_info_v1
         except Exception as exc:
             raise _SparseUnavailable(
                 f"aiter metadata prewarm unavailable: {exc}"
@@ -690,6 +691,13 @@ class _RealSparseMlaImpl:
                 latent_dim,
                 device=device,
                 dtype=query_dtype,
+            ),
+            "q_for_kernel_fp8": torch.empty(
+                max_tokens,
+                padded_num_heads,
+                latent_dim,
+                device=device,
+                dtype=dtypes.fp8,
             ),
             "latent_output": torch.empty(
                 max_tokens,
@@ -1174,6 +1182,7 @@ class _RealSparseMlaImpl:
                 )
         else:
             q_for_kernel = q_latent
+        output_dtype = q_for_kernel.dtype
         if in_capture and self._cg_sparse_bufs is not None:
             output = self._cg_sparse_bufs["latent_output"][
                 :num_tokens, : sparse_meta.padded_num_heads, :
@@ -1181,9 +1190,30 @@ class _RealSparseMlaImpl:
         else:
             output = torch.empty(
                 (num_tokens, sparse_meta.padded_num_heads, self.kv_lora_rank),
-                dtype=q_for_kernel.dtype,
+                dtype=output_dtype,
                 device=q_latent.device,
             )
+        fp8_scale_kwargs = {}
+        if self._cache_dtype_name(kv_cache_base) == "fp8":
+            kv_scale = self._cache_write_scale.get(kv_cache_base.device)
+            if kv_scale is None:
+                kv_scale = torch.tensor(
+                    1.0, dtype=torch.float32, device=kv_cache_base.device
+                )
+                self._cache_write_scale[kv_cache_base.device] = kv_scale
+            fp8_scale_kwargs = {"q_scale": kv_scale, "kv_scale": kv_scale}
+            try:
+                from aiter import dtypes
+            except Exception as exc:
+                raise _SparseUnavailable(f"aiter dtypes unavailable: {exc}") from exc
+            if in_capture and self._cg_sparse_bufs is not None:
+                q_for_kernel_fp8 = self._cg_sparse_bufs["q_for_kernel_fp8"][
+                    :num_tokens, : sparse_meta.padded_num_heads, :
+                ]
+                q_for_kernel_fp8.copy_(q_for_kernel)
+                q_for_kernel = q_for_kernel_fp8
+            else:
+                q_for_kernel = q_for_kernel.to(dtype=dtypes.fp8)
         try:
             kv_buffer = kv_cache_base.reshape(-1, 1, 1, latent_dim)
             if (
@@ -1221,6 +1251,7 @@ class _RealSparseMlaImpl:
                 reduce_indptr=sparse_meta.reduce_indptr,
                 reduce_final_map=sparse_meta.reduce_final_map,
                 reduce_partial_map=sparse_meta.reduce_partial_map,
+                **fp8_scale_kwargs,
             )
         except Exception as exc:
             raise _SparseUnavailable(f"mla_decode_fwd failed: {exc}") from exc
