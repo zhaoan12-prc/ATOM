@@ -13,18 +13,7 @@ from rtp_llm.ops import HybridAttentionType, ParallelismConfig
 from rtp_llm.ops.compute_ops import PyModelInputs, PyModelOutputs
 from rtp_llm.utils.model_weight import W
 
-from atom.model_loader.loader import WeightsMapper
-from atom.models.qwen3_5 import (
-    detect_fused_expert_format,
-    get_fused_expert_mapping,
-    load_fused_expert_weights,
-)
-from atom.plugin.rtpllm.attention_backend import (
-    apply_attention_gdn_rtpllm_patch,
-    apply_attention_mha_rtpllm_patch,
-)
 from atom.plugin.rtpllm.models.qwen3_next import apply_qwen3_next_rtpllm_patch
-from atom.plugin.rtpllm.utils import RTPForwardQwen35HybridContext
 
 logger = logging.getLogger("atom.plugin.rtpllm.models")
 
@@ -126,8 +115,11 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             )
         self._model_device = first_param.device
         self._model_dtype = first_param.dtype
+        from atom.plugin.rtpllm.utils import RTPForwardQwen35HybridContext
+
+        self._rtp_forward_context_cls = RTPForwardQwen35HybridContext
         # Cache module layer maps once to avoid per-forward model.modules() traversal.
-        self._rtp_layer_maps = RTPForwardQwen35HybridContext.collect_layer_maps(
+        self._rtp_layer_maps = self._rtp_forward_context_cls.collect_layer_maps(
             model=self.model
         )
         # Lazy-built in forward_context; invalidated by kv buffer signature change.
@@ -468,7 +460,7 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             ):
                 inputs_embeds = inputs_embeds.to(dtype=model_dtype)
 
-        with RTPForwardQwen35HybridContext.bind(
+        with self._rtp_forward_context_cls.bind(
             model=self.model,
             runtime=self,
             inputs=inputs,
@@ -586,7 +578,9 @@ class ATOMQwen35Moe(BaseModel):
         return True
 
     @staticmethod
-    def _make_qwen35_hf_mapper() -> WeightsMapper:
+    def _make_qwen35_hf_mapper():
+        from atom.model_loader.loader import WeightsMapper
+
         # Keep loading on outer text-only wrapper so packed_modules_mapping works.
         # Normalize checkpoint prefixes to match wrapper's weights_mapping rules.
         return WeightsMapper(
@@ -754,6 +748,12 @@ class ATOMQwen35Moe(BaseModel):
             shard_id: str,
             num_experts: int,
         ) -> bool:
+            from atom.models.qwen3_5 import (
+                detect_fused_expert_format,
+                get_fused_expert_mapping,
+                load_fused_expert_weights,
+            )
+
             if not detect_fused_expert_format(original_name):
                 return False
             mapping = get_fused_expert_mapping()
@@ -771,6 +771,11 @@ class ATOMQwen35Moe(BaseModel):
         try:
             # Keep RTP-specific behavior in plugin path only.
             _set_framework_backbone("rtpllm")
+            from atom.plugin.rtpllm.attention_backend import (
+                apply_attention_gdn_rtpllm_patch,
+                apply_attention_mha_rtpllm_patch,
+            )
+
             apply_attention_gdn_rtpllm_patch()
             apply_attention_mha_rtpllm_patch()
             apply_qwen3_next_rtpllm_patch()

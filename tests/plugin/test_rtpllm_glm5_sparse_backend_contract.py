@@ -37,6 +37,15 @@ def _load_sparse_backend(monkeypatch):
     return module.RTPSparseMlaBackend
 
 
+def _forward_context_module():
+    module = sys.modules.get("atom.utils.forward_context")
+    if module is None:
+        module = type(sys)("atom.utils.forward_context")
+        module.get_forward_context = lambda: None
+        sys.modules["atom.utils.forward_context"] = module
+    return module
+
+
 def test_rtp_sparse_attn_indexer_bridge_forwards_to_main_indexer(monkeypatch):
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
     calls = []
@@ -85,7 +94,7 @@ def test_rtp_sparse_attn_indexer_bridge_forwards_to_main_indexer(monkeypatch):
 
 def test_rtp_sparse_attn_indexer_uses_rtp_topk_path_when_context_exists(monkeypatch):
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
-    forward_context_mod = sys.modules["atom.utils.forward_context"]
+    forward_context_mod = _forward_context_module()
     fake_forward_context = SimpleNamespace(
         context=SimpleNamespace(is_prefill=False, is_dummy_run=False, batch_size=1),
         attn_metadata=SimpleNamespace(max_seqlen_q=1),
@@ -197,7 +206,7 @@ def test_rtp_sparse_attn_indexer_fake_bridge_forwards_to_main_fake(monkeypatch):
 
 def test_rtp_sparse_attn_indexer_short_prefill_fills_causal_topk(monkeypatch):
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
-    forward_context_mod = sys.modules["atom.utils.forward_context"]
+    forward_context_mod = _forward_context_module()
     fake_forward_context = SimpleNamespace(
         context=SimpleNamespace(is_prefill=True, is_dummy_run=False),
         attn_metadata=SimpleNamespace(max_seqlen_k=4),
@@ -331,7 +340,7 @@ def test_sparse_backend_passes_topk_through_unchanged(monkeypatch):
 
 def test_sparse_backend_prefill_without_topk_raises(monkeypatch):
     backend_cls = _load_sparse_backend(monkeypatch)
-    forward_context_mod = sys.modules["atom.utils.forward_context"]
+    forward_context_mod = _forward_context_module()
     fake_forward_context = SimpleNamespace(
         context=SimpleNamespace(is_dummy_run=False),
         attn_metadata=SimpleNamespace(
@@ -361,7 +370,7 @@ def test_sparse_backend_prefill_without_topk_raises(monkeypatch):
 def test_sparse_backend_decode_without_topk_raises(monkeypatch):
     backend_cls = _load_sparse_backend(monkeypatch)
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
-    forward_context_mod = sys.modules["atom.utils.forward_context"]
+    forward_context_mod = _forward_context_module()
     fake_forward_context = SimpleNamespace(
         context=SimpleNamespace(is_dummy_run=False),
         attn_metadata=SimpleNamespace(
@@ -406,7 +415,7 @@ def test_sparse_backend_threads_kv_cache_and_layer_id_to_sparse_impl(monkeypatch
 
 def test_sparse_backend_pulls_attn_metadata_from_forward_context(monkeypatch):
     backend_cls = _load_sparse_backend(monkeypatch)
-    forward_context_mod = sys.modules["atom.utils.forward_context"]
+    forward_context_mod = _forward_context_module()
 
     attn_metadata = SimpleNamespace(block_table="block-table", seq_lens="seq-lens")
     fake_forward_context = SimpleNamespace(
@@ -432,7 +441,7 @@ def test_sparse_backend_pulls_attn_metadata_from_forward_context(monkeypatch):
 def test_sparse_backend_prefill_missing_sparse_kernel_raises(monkeypatch):
     backend_cls = _load_sparse_backend(monkeypatch)
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
-    forward_context_mod = sys.modules["atom.utils.forward_context"]
+    forward_context_mod = _forward_context_module()
 
     attn_metadata = SimpleNamespace(
         plugin_metadata=SimpleNamespace(num_prefills=1, is_dummy_warmup=False)
@@ -470,7 +479,7 @@ def test_sparse_backend_prefill_missing_sparse_kernel_raises(monkeypatch):
 def test_sparse_backend_decode_missing_sparse_kernel_still_raises(monkeypatch):
     backend_cls = _load_sparse_backend(monkeypatch)
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
-    forward_context_mod = sys.modules["atom.utils.forward_context"]
+    forward_context_mod = _forward_context_module()
 
     attn_metadata = SimpleNamespace(
         plugin_metadata=SimpleNamespace(num_prefills=0, is_dummy_warmup=False)
@@ -555,7 +564,12 @@ def test_real_sparse_decode_uses_atom_aiter_metadata(monkeypatch):
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
     calls = {}
 
-    import aiter
+    aiter = type(sys)("aiter")
+    aiter.dtypes = SimpleNamespace(
+        fp8=torch.float8_e4m3fnuz,
+        d_dtypes={"fp16": torch.float16, "bf16": torch.bfloat16},
+    )
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
 
     def fake_metadata_info(*args, **kwargs):
         calls["metadata_info"] = (args, kwargs)
