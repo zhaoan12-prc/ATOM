@@ -1,8 +1,7 @@
-try:
-    from .models import base_model_wrapper as _base_model_wrapper
-except ModuleNotFoundError as exc:
-    if exc.name != "rtp_llm":
-        raise
-    _base_model_wrapper = None
+"""RTP-LLM plugin helpers.
 
-__all__ = ["_base_model_wrapper"]
+Keep the package root import side-effect free. RTP external model registration
+is triggered by importing ``atom.plugin.rtpllm.models``.
+"""
+
+__all__: list[str] = []

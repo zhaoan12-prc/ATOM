@@ -234,10 +234,11 @@ class RTPMLAAttention:
 def apply_attention_mla_rtpllm_patch() -> None:
     """Switch ATOM's generic Attention symbol to the RTP MLA adapter."""
 
+    import importlib
     import sys
 
-    import atom.model_ops as ops
-    import atom.model_ops.base_attention as base_attention
+    ops = importlib.import_module("atom.model_ops")
+    base_attention = importlib.import_module("atom.model_ops.base_attention")
 
     ops.RTPMLAAttention = RTPMLAAttention
     ops.Attention = RTPMLAAttention

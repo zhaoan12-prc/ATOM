@@ -53,6 +53,10 @@ def _install_fake_rtp_modules() -> dict[str, ModuleType]:
         def set_global_weight(self, name, tensor):
             self.global_weights[name] = tensor
 
+    class _FakeModelDeployWeightInfo:
+        pass
+
+    fake_weight_info_mod.ModelDeployWeightInfo = _FakeModelDeployWeightInfo
     fake_weight_info_mod.ModelWeights = _FakeModelWeights
 
     fake_module_base_mod = ModuleType("rtp_llm.models_py.model_desc.module_base")
@@ -168,6 +172,14 @@ def test_glm5_create_python_model_lets_prepare_model_own_mla_patching():
     fake_modules = _install_fake_rtp_modules()
     fake_atom_model = MagicMock(name="atom_model")
     fake_atom_model.to.return_value = fake_atom_model
+    fake_utils_mod = ModuleType("atom.plugin.rtpllm.utils")
+
+    class _FakeRTPForwardMLAContext:
+        @staticmethod
+        def collect_layer_maps(model):
+            return ({}, {}, {})
+
+    fake_utils_mod.RTPForwardMLAContext = _FakeRTPForwardMLAContext
 
     with (
         patch.dict(
@@ -178,6 +190,7 @@ def test_glm5_create_python_model_lets_prepare_model_own_mla_patching():
             os.environ,
             {"RTP_LLM_EXTERNAL_MODEL_PACKAGES": "atom.plugin.rtpllm.models"},
         ),
+        patch.dict(sys.modules, {"atom.plugin.rtpllm.utils": fake_utils_mod}),
         patch(
             "atom.prepare_model", return_value=fake_atom_model, create=True
         ) as prepare_model,
