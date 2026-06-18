@@ -1,13 +1,23 @@
 """Lifecycle tests for the GLM5 rtp-llm wrapper."""
 
+import ast
 from contextlib import nullcontext
 import importlib
 import os
+from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
+
+_ATOM_ROOT = Path(__file__).resolve().parents[2]
+_FORBIDDEN_IMPORT_TIME_SPARSE_KERNELS = {
+    "flashmla_sparse",
+    "flash_mla",
+    "sparse_mla",
+    "attention_mla_sparse",
+}
 
 
 def _package(name: str) -> ModuleType:
@@ -166,6 +176,10 @@ def _patch_optional_attr(module, attr):
     if hasattr(module, attr):
         return patch.object(module, attr)
     return nullcontext(MagicMock(name=attr))
+
+
+def _read_plugin_file(relative_path: str) -> str:
+    return (_ATOM_ROOT / relative_path).read_text()
 
 
 def test_glm5_create_python_model_lets_prepare_model_own_mla_patching():
@@ -438,3 +452,212 @@ def test_glm5_runtime_graph_decode_ignores_stale_position_ids():
         )
 
     assert positions.cpu().tolist() == [34, 48, 49]
+
+
+def test_rtpllm_wrapper_registers_glm5_override_and_alias():
+    register_model_mock = MagicMock()
+
+    fake_rtp_register_mod = ModuleType("rtp_llm.model_factory_register")
+    fake_rtp_register_mod.register_model = register_model_mock
+    fake_rtp_register_mod._model_factory = {}
+    fake_rtp_register_mod._hf_architecture_2_ft = {}
+
+    fake_atom_register_mod = ModuleType("atom.plugin.register")
+    fake_atom_register_mod._ATOM_SUPPORTED_MODELS = {}
+
+    fake_atom_deepseek_mod = ModuleType("atom.models.deepseek_v2")
+
+    class _FakeGlmMoeDsaForCausalLM:
+        pass
+
+    fake_atom_deepseek_mod.GlmMoeDsaForCausalLM = _FakeGlmMoeDsaForCausalLM
+
+    fake_atom_qwen_mod = ModuleType("atom.plugin.rtpllm.models.qwen3_5")
+
+    class _FakeATOMQwen35Moe:
+        pass
+
+    fake_atom_qwen_mod.ATOMQwen35Moe = _FakeATOMQwen35Moe
+
+    fake_atom_glm_mod = ModuleType("atom.plugin.rtpllm.models.glm5")
+
+    class _FakeATOMGlm5Moe:
+        pass
+
+    fake_atom_glm_mod.ATOMGlm5Moe = _FakeATOMGlm5Moe
+
+    fake_modules = {
+        "rtp_llm": _package("rtp_llm"),
+        "rtp_llm.models": _package("rtp_llm.models"),
+        "rtp_llm.model_factory_register": fake_rtp_register_mod,
+        "atom.models.deepseek_v2": fake_atom_deepseek_mod,
+        "atom.plugin.register": fake_atom_register_mod,
+        "atom.plugin.rtpllm.models.qwen3_5": fake_atom_qwen_mod,
+        "atom.plugin.rtpllm.models.glm5": fake_atom_glm_mod,
+    }
+
+    with patch.dict(sys.modules, fake_modules):
+        sys.modules.pop("atom.plugin.rtpllm.models", None)
+        sys.modules.pop("atom.plugin.rtpllm.models.base_model_wrapper", None)
+        importlib.import_module("atom.plugin.rtpllm.models")
+
+        assert fake_rtp_register_mod._model_factory["glm_5"] is _FakeATOMGlm5Moe
+        assert (
+            fake_rtp_register_mod._hf_architecture_2_ft["GlmMoeDsaForCausalLM"]
+            == "glm_5"
+        )
+        assert (
+            fake_atom_register_mod._ATOM_SUPPORTED_MODELS["GlmMoeDsaForCausalLM"]
+            is _FakeGlmMoeDsaForCausalLM
+        )
+        register_model_mock.assert_has_calls(
+            [
+                call("atom_qwen35_moe", _FakeATOMQwen35Moe, []),
+                call("atom_glm5_moe", _FakeATOMGlm5Moe, []),
+            ],
+            any_order=False,
+        )
+
+
+def test_glm5_bridge_mode_starts_in_m0_dense():
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_metadata import (
+        GLM5_RTP_BRIDGE_MODE,
+        GLM5_RTP_BRIDGE_MODE_M0_DENSE,
+    )
+
+    assert GLM5_RTP_BRIDGE_MODE == GLM5_RTP_BRIDGE_MODE_M0_DENSE
+
+
+def test_glm5_ownership_unique_and_separates_rope_paths():
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_metadata import (
+        GLM5_RTP_OWNERSHIP,
+    )
+
+    required = {
+        "main_q_norm",
+        "main_kv_norm",
+        "main_rope",
+        "main_kv_cache",
+        "indexer_k_norm",
+        "indexer_rope",
+        "indexer_cache",
+        "topk_selector",
+    }
+
+    assert required <= set(GLM5_RTP_OWNERSHIP)
+    for key in required:
+        owner = GLM5_RTP_OWNERSHIP[key]
+        assert isinstance(owner, str)
+        assert owner
+
+    assert GLM5_RTP_OWNERSHIP["main_rope"] != GLM5_RTP_OWNERSHIP["indexer_rope"]
+
+
+def test_glm5_ownership_forbids_qwen_and_mha_components():
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_metadata import (
+        GLM5_RTP_OWNERSHIP,
+    )
+
+    forbidden = ("GatedDeltaNet", "RTPFullAttention", "Qwen3Next")
+    for owner in GLM5_RTP_OWNERSHIP.values():
+        assert all(name not in owner for name in forbidden)
+
+
+def test_mla_attention_legacy_boundary_shape_stays_executable_during_migration():
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
+
+    q = torch.empty(2, 4, 256)
+    compressed_kv = torch.empty(2, 512)
+    k_pe = torch.empty(2, 64)
+    positions = torch.arange(2, dtype=torch.int32)
+    attention = RTPMLAAttention(mla_modules=SimpleNamespace(v_head_dim=128))
+
+    output = attention(q, compressed_kv, k_pe, positions=positions)
+
+    assert output.shape == (2, 4, 128)
+
+
+def test_mla_attention_is_marked_as_mla_adapter():
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import RTPMLAAttention
+
+    assert RTPMLAAttention.use_mla is True
+
+
+def test_glm5_wrapper_does_not_use_mha_or_qwen_patches():
+    source = _read_plugin_file("atom/plugin/rtpllm/models/glm5.py")
+
+    assert "RTPFullAttention" not in source
+    assert "apply_attention_mha_rtpllm_patch" not in source
+    assert "apply_attention_gdn_rtpllm_patch" not in source
+    assert "apply_qwen3_next_rtpllm_patch" not in source
+
+
+def test_glm5_wrapper_does_not_import_or_call_deepseek_mla_patch():
+    source = _read_plugin_file("atom/plugin/rtpllm/models/glm5.py")
+
+    assert "apply_deepseek_mla_rtpllm_patch" not in source
+
+
+def test_rtp_mla_prepare_no_longer_contains_deepseek_forward_monkey_patch():
+    assert not (
+        _ATOM_ROOT / "atom/plugin/rtpllm/attention_backend/rtp_mla_prepare.py"
+    ).exists()
+
+
+def test_glm5_mla_backend_is_not_full_attention_adapter():
+    source = _read_plugin_file(
+        "atom/plugin/rtpllm/attention_backend/rtp_mla_attention.py"
+    )
+
+    assert "class RTPMLAAttention" in source
+    assert "use_mla" in source
+    assert "RTPFullAttention" not in source
+
+
+def test_sparse_mla_backend_has_no_import_time_cuda_sparse_kernel_dependencies():
+    backend_path = (
+        _ATOM_ROOT / "atom/plugin/rtpllm/attention_backend/rtp_sparse_mla_backend.py"
+    )
+    assert backend_path.exists()
+
+    tree = ast.parse(backend_path.read_text())
+    imported_modules = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported_modules.add(node.module)
+
+    assert not any(
+        forbidden in module_name.split(".")
+        for module_name in imported_modules
+        for forbidden in _FORBIDDEN_IMPORT_TIME_SPARSE_KERNELS
+    )
+
+
+def test_rtp_mla_patch_updates_deepseek_attention_symbol(monkeypatch):
+    import types
+
+    from atom.plugin.rtpllm.attention_backend.rtp_mla_attention import (
+        RTPMLAAttention,
+        apply_attention_mla_rtpllm_patch,
+    )
+
+    sentinel = object()
+    fake_ops = types.ModuleType("atom.model_ops")
+    fake_ops.Attention = sentinel
+    fake_base_attention = types.ModuleType("atom.model_ops.base_attention")
+    fake_base_attention.Attention = sentinel
+    fake_deepseek = types.ModuleType("atom.models.deepseek_v2")
+    fake_deepseek.Attention = sentinel
+    monkeypatch.setitem(sys.modules, "atom.model_ops", fake_ops)
+    monkeypatch.setitem(
+        sys.modules, "atom.model_ops.base_attention", fake_base_attention
+    )
+    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", fake_deepseek)
+
+    apply_attention_mla_rtpllm_patch()
+
+    assert fake_ops.Attention is RTPMLAAttention
+    assert fake_base_attention.Attention is RTPMLAAttention
+    assert fake_deepseek.Attention is RTPMLAAttention
