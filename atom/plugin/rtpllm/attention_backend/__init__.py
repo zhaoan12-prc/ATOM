@@ -1,10 +1,4 @@
 from .rtp_mla_attention import RTPMLAAttention, apply_attention_mla_rtpllm_patch
-from .rtp_mla_metadata import (
-    GLM5_RTP_MLA_MODE,
-    GLM5_RTP_MLA_MODE_DENSE,
-    GLM5_RTP_OWNERSHIP,
-    RTPMlaPluginMetadata,
-)
 from .rtp_sparse_mla_backend import RTPSparseMlaBackend
 
 
@@ -37,10 +31,6 @@ __all__ = [
     "RTPFullAttention",
     "RTPMLAAttention",
     "RTPSparseMlaBackend",
-    "GLM5_RTP_MLA_MODE",
-    "GLM5_RTP_MLA_MODE_DENSE",
-    "GLM5_RTP_OWNERSHIP",
-    "RTPMlaPluginMetadata",
     "apply_attention_gdn_rtpllm_patch",
     "apply_attention_mha_rtpllm_patch",
     "apply_attention_mla_rtpllm_patch",
