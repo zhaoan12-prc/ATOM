@@ -7,9 +7,8 @@ from typing import Optional
 
 import torch
 
-
-GLM5_RTP_BRIDGE_MODE_M0_DENSE = "m0_dense"
-GLM5_RTP_BRIDGE_MODE = GLM5_RTP_BRIDGE_MODE_M0_DENSE
+GLM5_RTP_MLA_MODE_DENSE = "dense"
+GLM5_RTP_MLA_MODE = GLM5_RTP_MLA_MODE_DENSE
 
 
 GLM5_RTP_OWNERSHIP = {
@@ -26,14 +25,9 @@ GLM5_RTP_OWNERSHIP = {
 
 @dataclass(frozen=True)
 class RTPMlaPluginMetadata:
-    """Minimal M0 placeholder for RTP MLA metadata.
-
-    M0 intentionally does not model indexer/top-k metadata. M1/M2 should extend
-    this structure instead of overloading MHA plugin metadata.
-    """
+    """Metadata shared by GLM5 RTP MLA attention paths."""
 
     is_prefill: bool
     slot_mapping: Optional[torch.Tensor] = None
     block_table: Optional[torch.Tensor] = None
     seq_lens: Optional[torch.Tensor] = None
-

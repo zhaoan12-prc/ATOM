@@ -19,7 +19,7 @@ def _resolve_index_topk(attn) -> int:
         value = getattr(obj, attr, None) if obj is not None else None
         if value is not None:
             return int(value)
-    raise AttributeError("GLM5 RTP MLA M1 indexer requires index_topk/topk_tokens")
+    raise AttributeError("GLM5 RTP MLA indexer requires index_topk/topk_tokens")
 
 
 def _get_topk_indices_buffer(attn) -> torch.Tensor:
@@ -32,7 +32,7 @@ def _get_topk_indices_buffer(attn) -> torch.Tensor:
     if buffer is None:
         buffer = getattr(attn, "_topk_indices_buffer", None)
     if buffer is None:
-        raise AttributeError("GLM5 RTP MLA M1 indexer requires topk_indices_buffer")
+        raise AttributeError("GLM5 RTP MLA indexer requires topk_indices_buffer")
     return buffer
 
 

@@ -757,7 +757,7 @@ class ATOMGlm5Moe(DeepSeekV2):
                     getattr(atom_model, "model", None), "atom_config", None
                 )
             if atom_config is None:
-                # M0 tests use mocked ATOM models; real loading must expose atom_config.
+                # Unit tests may use mocked ATOM models; real loading must expose atom_config.
                 atom_config = getattr(self, "atom_config", None)
 
             load_model_in_plugin_mode(
