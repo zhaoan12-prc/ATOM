@@ -117,7 +117,7 @@ class RTPMLAAttention:
             if self.indexer is not None
             else None
         )
-        injected_backend = kwargs.get("sparse_backend", kwargs.get("dense_backend"))
+        injected_backend = kwargs.get("sparse_backend")
         if injected_backend is not None:
             self.sparse_backend = injected_backend
         elif mla_modules is not None:
