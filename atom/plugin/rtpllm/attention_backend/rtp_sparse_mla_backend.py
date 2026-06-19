@@ -60,7 +60,7 @@ class _AtomSparseMetadata:
 
 
 class _ContractSparseMlaImpl:
-    """CPU/mock sparse implementation used before the real RTP kernel is wired."""
+    """Lightweight implementation for unit tests and explicit dependency injection."""
 
     def __init__(self, v_head_dim: int) -> None:
         self.v_head_dim = int(v_head_dim)
@@ -1138,24 +1138,6 @@ class _RealSparseMlaImpl:
             page_size=page_size,
         )
 
-    def _run_sparse_decode(
-        self,
-        *,
-        q_latent: torch.Tensor,
-        kv_cache_base: torch.Tensor,
-        topk_indices: torch.Tensor,
-        attn_metadata: Any,
-        block_size: int,
-    ) -> torch.Tensor:
-        # Keep GLM5 sparse path aligned with ATOM native MLA kernels.
-        return self._run_aiter_sparse_decode(
-            q_latent=q_latent,
-            kv_cache_base=kv_cache_base,
-            topk_indices=topk_indices,
-            attn_metadata=attn_metadata,
-            block_size=block_size,
-        )
-
     def _run_aiter_sparse_decode(
         self,
         *,
@@ -1357,7 +1339,7 @@ class _RealSparseMlaImpl:
             raise _SparseUnavailable(
                 "GLM5 RTP sparse MLA requires physical block size."
             )
-        latent_output = self._run_sparse_decode(
+        latent_output = self._run_aiter_sparse_decode(
             q_latent=q_latent,
             kv_cache_base=kv_cache_base,
             topk_indices=topk_indices,
@@ -1387,10 +1369,12 @@ class _RealSparseMlaImpl:
 
 
 class RTPSparseMlaBackend:
-    """M2 sparse top-k consumption contract.
+    """Sparse MLA backend used by GLM5 RTP plugin mode.
 
-    This backend intentionally avoids importing RTP CUDA sparse kernels. It only
-    validates and threads the sparse contract so M2.5 can replace the mock impl.
+    Real GLM5 layers use ATOM-owned MLA modules and the AITER sparse decode
+    kernel. The lightweight implementation is kept for unit tests and explicit
+    injection only; production paths refuse dense fallback when sparse execution
+    is unavailable.
     """
 
     def __init__(
