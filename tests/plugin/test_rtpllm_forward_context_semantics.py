@@ -307,6 +307,45 @@ def test_plugin_attention_metadata_builds_req_id_per_token():
     assert md.total_kv == 3
 
 
+def test_build_req_id_per_token_prefers_prewarmed_i32_buffer(monkeypatch):
+    query_start_loc = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    seq_id_i32 = torch.arange(8, dtype=torch.int32)
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    req_id = RTPForwardContext._build_req_id_per_token(
+        query_start_loc=query_start_loc,
+        num_tokens=3,
+        device=query_start_loc.device,
+        cg_bufs={
+            "seq_id": torch.arange(8, dtype=torch.int64),
+            "seq_id_i32": seq_id_i32,
+        },
+    )
+
+    assert req_id.dtype == torch.int32
+    assert req_id.data_ptr() == seq_id_i32.data_ptr()
+    assert req_id.cpu().tolist() == [0, 1, 2]
+
+
+def test_build_req_id_per_token_requires_prewarmed_i32_buffer_in_capture(monkeypatch):
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    try:
+        RTPForwardContext._build_req_id_per_token(
+            query_start_loc=query_start_loc,
+            num_tokens=1,
+            device=query_start_loc.device,
+            cg_bufs={"seq_id": torch.arange(1, dtype=torch.int64)},
+        )
+    except RuntimeError as exc:
+        assert "prewarmed seq_id_i32" in str(exc)
+    else:
+        raise AssertionError("expected missing seq_id_i32 to fail during capture")
+
+
 def test_rtpllm_decode_seq_lens_uses_rtp_plus_one_in_graph_and_eager_modes():
     input_lengths = torch.tensor([1], dtype=torch.int32)
     sequence_lengths = torch.tensor([35], dtype=torch.int32)

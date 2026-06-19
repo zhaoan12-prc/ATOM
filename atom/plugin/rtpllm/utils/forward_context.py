@@ -900,13 +900,33 @@ class RTPForwardContext:
             raise ValueError(
                 "RTP plugin cannot build req_id_per_token for empty batch."
             )
+        in_capture = torch.cuda.is_current_stream_capturing()
+        if cg_bufs is not None and "seq_id_i32" in cg_bufs:
+            seq_id_i32 = cg_bufs["seq_id_i32"]
+            if not isinstance(seq_id_i32, torch.Tensor):
+                raise RuntimeError(
+                    "RTP plugin capture requires prewarmed seq_id_i32 tensor."
+                )
+            if int(seq_id_i32.shape[0]) < int(num_tokens):
+                raise RuntimeError(
+                    "RTP plugin prewarmed seq_id_i32 buffer is too small "
+                    f"(buffer={int(seq_id_i32.shape[0])}, required={int(num_tokens)})."
+                )
+            if seq_id_i32.device != device or seq_id_i32.dtype != torch.int32:
+                raise RuntimeError(
+                    "RTP plugin capture requires seq_id_i32 to be int32 on model device."
+                )
+            if not seq_id_i32.is_contiguous():
+                raise RuntimeError(
+                    "RTP plugin capture requires seq_id_i32 to be contiguous."
+                )
+            return seq_id_i32[:num_tokens]
+        if in_capture:
+            raise RuntimeError(
+                "RTP plugin capture requires prewarmed seq_id_i32 for req_id_per_token."
+            )
         if int(num_tokens) == 0:
             return torch.empty((0,), dtype=torch.int32, device=device)
-        if cg_bufs is not None and "seq_id" in cg_bufs:
-            seq_id = cg_bufs["seq_id"][:num_tokens]
-            return seq_id.to(
-                device=device, dtype=torch.int32, non_blocking=True
-            ).contiguous()
         lengths = (query_start_loc[1:] - query_start_loc[:-1]).to(dtype=torch.int64)
         if not torch.cuda.is_current_stream_capturing() and int(
             lengths.sum().item()

@@ -396,6 +396,7 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
                 0, max_bs + 1, device=device, dtype=torch.int32
             ),
             "seq_id": torch.arange(0, max_bs, device=device, dtype=torch.int64),
+            "seq_id_i32": torch.arange(0, max_bs, device=device, dtype=torch.int32),
             "block_col": torch.empty(max_bs, device=device, dtype=torch.int32),
             "block_col_i64": torch.empty(max_bs, device=device, dtype=torch.int64),
             "slot_base": torch.empty(max_bs, device=device, dtype=torch.int32),
