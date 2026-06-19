@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Tuple
@@ -364,22 +362,6 @@ class RTPForwardContext:
                 )
             return by_group[gid]
         return getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
-
-    @staticmethod
-    def _select_physical_block_table_for_layer(
-        attn_inputs: Any,
-        group_id: int | None = None,
-    ) -> torch.Tensor | None:
-        # MLA cache writes use concat_and_cache_mla(slot_mapping), whose slot is
-        # indexed in the physical KV cache layout, not the smaller kernel block
-        # granularity used by some RTP attention kernels.
-        block_table = getattr(attn_inputs, "kv_cache_block_id_device", None)
-        if block_table is not None:
-            return block_table
-        return RTPForwardContext._select_block_table_for_layer(
-            attn_inputs=attn_inputs,
-            group_id=group_id,
-        )
 
     @staticmethod
     def _recover_physical_block_table_from_kernel(
@@ -1636,70 +1618,6 @@ class RTPForwardContext:
             context=context,
             num_tokens=int(positions.numel()),
             mla_layer_map=cls._resolve_mla_layer_map(resolved_layer_maps),
-        )
-
-    @staticmethod
-    def _use_rtp_indexer_cache() -> bool:
-        return os.getenv("ATOM_RTP_USE_RTP_INDEXER_CACHE", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-
-    @staticmethod
-    def _resolve_rtp_indexer_cache(
-        *,
-        layer_num: int,
-        layer_cache: Any,
-        indexer: Any,
-        block_size: int,
-    ) -> torch.Tensor:
-        kv_scale_base = getattr(layer_cache, "kv_scale_base", None)
-        if kv_scale_base is None or kv_scale_base.numel() == 0:
-            raise ValueError(
-                f"Layer {layer_num} RTP indexer cache requires non-empty kv_scale_base."
-            )
-        if kv_scale_base.dtype == torch.uint8:
-            kv_scale_base = kv_scale_base.view(dtypes.fp8)
-        if kv_scale_base.dtype != dtypes.fp8:
-            raise ValueError(
-                f"Layer {layer_num} RTP indexer cache dtype mismatch "
-                f"(got={kv_scale_base.dtype}, expected={dtypes.fp8} or torch.uint8)."
-            )
-        if block_size <= 0:
-            raise ValueError(
-                f"Layer {layer_num} RTP indexer cache got invalid block_size={block_size}."
-            )
-        head_dim = int(getattr(indexer, "head_dim", 0) or 0)
-        if head_dim <= 0:
-            raise ValueError(
-                f"Layer {layer_num} RTP indexer cache requires positive indexer.head_dim."
-            )
-        if head_dim != 128:
-            warnings.warn(
-                "RTP indexer cache binding has only been layout-checked for "
-                "GLM5 head_dim=128; cross-kernel byte semantics are not verified "
-                f"for head_dim={head_dim}.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        expected_raw_dim = head_dim + (head_dim // 128) * 4
-        expected_aligned_dim = ((expected_raw_dim + 15) // 16) * 16
-        allowed_dims = {expected_raw_dim, expected_aligned_dim}
-
-        if kv_scale_base.dim() == 3 and int(kv_scale_base.shape[-1]) in allowed_dims:
-            return kv_scale_base
-        if kv_scale_base.dim() == 2 and int(kv_scale_base.shape[1]) % block_size == 0:
-            per_token_dim = int(kv_scale_base.shape[1]) // block_size
-            if per_token_dim in allowed_dims:
-                return kv_scale_base.view(
-                    kv_scale_base.shape[0], block_size, per_token_dim
-                )
-        raise ValueError(
-            f"Layer {layer_num} RTP indexer cache layout mismatch "
-            f"(shape={tuple(kv_scale_base.shape)}, block_size={block_size}, "
-            f"allowed_last_dims={sorted(allowed_dims)})."
         )
 
     @classmethod
