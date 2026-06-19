@@ -1,4 +1,4 @@
-"""Contract-executable sparse MLA backend for GLM5 rtp-llm plugin mode."""
+"""Sparse MLA backend for GLM5 rtp-llm plugin mode."""
 
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ def _resolve_plugin_sparse_index_converter():
     """Resolve the plugin-style request-local topk to global KV index converter."""
     errors: list[str] = []
     for module_name in (
-        # Old GLM5 RTP branch location.
+        # Compatibility import path used by earlier plugin layouts.
         "atom.plugin.attention_mla_sparse",
-        # Current refactored plugin location with the same call contract.
+        # Current plugin helper location with the same call signature.
         "atom.plugin.vllm.attention.layer_sparse_mla",
     ):
         try:
@@ -59,7 +59,7 @@ class _AtomSparseMetadata:
     page_size: int
 
 
-class _ContractSparseMlaImpl:
+class _LightweightSparseMlaImpl:
     """Lightweight implementation for unit tests and explicit dependency injection."""
 
     def __init__(self, v_head_dim: int) -> None:
@@ -1394,7 +1394,7 @@ class RTPSparseMlaBackend:
         self.v_head_dim = int(v_head_dim)
         if sparse_impl is not None:
             self.sparse_impl = sparse_impl
-            self._default_mock = False
+            self._uses_lightweight_impl = False
         elif mla_modules is not None and all(
             hasattr(mla_modules, attr)
             for attr in (
@@ -1410,10 +1410,10 @@ class RTPSparseMlaBackend:
                 v_head_dim=self.v_head_dim,
                 scale=scale,
             )
-            self._default_mock = False
+            self._uses_lightweight_impl = False
         else:
-            self.sparse_impl = _ContractSparseMlaImpl(self.v_head_dim)
-            self._default_mock = True
+            self.sparse_impl = _LightweightSparseMlaImpl(self.v_head_dim)
+            self._uses_lightweight_impl = True
         self._sparse_impl_accepts_positions = self._impl_accepts_positions(
             self.sparse_impl
         )
@@ -1492,13 +1492,13 @@ class RTPSparseMlaBackend:
             return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
 
         if topk_indices is None:
-            if self._default_mock:
+            if self._uses_lightweight_impl:
                 return q.new_zeros((q.shape[0], q.shape[1], self.v_head_dim))
             raise _SparseUnavailable(
                 "GLM5 RTP sparse MLA requires topk_indices; refusing dense fallback."
             )
         self._validate_topk_indices(q, topk_indices)
-        if self._default_mock or not callable(
+        if self._uses_lightweight_impl or not callable(
             getattr(self.sparse_impl, "forward", None)
         ):
             raise _SparseUnavailable(

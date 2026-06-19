@@ -519,13 +519,13 @@ def test_rtpllm_wrapper_registers_glm5_override_and_alias():
         )
 
 
-def test_glm5_bridge_mode_starts_in_m0_dense():
+def test_glm5_mla_mode_starts_in_dense_mode():
     from atom.plugin.rtpllm.attention_backend.rtp_mla_metadata import (
-        GLM5_RTP_BRIDGE_MODE,
-        GLM5_RTP_BRIDGE_MODE_M0_DENSE,
+        GLM5_RTP_MLA_MODE,
+        GLM5_RTP_MLA_MODE_DENSE,
     )
 
-    assert GLM5_RTP_BRIDGE_MODE == GLM5_RTP_BRIDGE_MODE_M0_DENSE
+    assert GLM5_RTP_MLA_MODE == GLM5_RTP_MLA_MODE_DENSE
 
 
 def test_glm5_ownership_unique_and_separates_rope_paths():

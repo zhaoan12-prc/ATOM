@@ -1,4 +1,4 @@
-"""Contract-executable tests for GLM5 RTP MLA M2 sparse topk consumption."""
+"""Tests for GLM5 RTP MLA sparse topk consumption."""
 
 import builtins
 import importlib
@@ -23,7 +23,7 @@ def _guard_sparse_kernel_imports(monkeypatch):
     def _guarded_import(name, *args, **kwargs):
         if any(part in _FORBIDDEN_CUDA_SPARSE_MODULES for part in name.split(".")):
             raise AssertionError(
-                f"M2 sparse contract must not import CUDA sparse kernel: {name}"
+                f"GLM5 RTP sparse tests must not import CUDA sparse kernel: {name}"
             )
         return original_import(name, *args, **kwargs)
 
@@ -302,7 +302,7 @@ def _build_backend(backend_cls, sparse_impl):
         kwargs["sparse_impl"] = sparse_impl
     else:
         raise AssertionError(
-            "RTPSparseMlaBackend must accept a mock sparse impl injection"
+            "RTPSparseMlaBackend must accept an injected sparse implementation"
         )
 
     if "v_head_dim" in params:
