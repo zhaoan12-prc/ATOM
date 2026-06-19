@@ -209,16 +209,6 @@ class _RealSparseMlaImpl:
             return 0
         return int(kv_cache_base.numel() // latent_dim)
 
-    @staticmethod
-    def _unwrap_linear_output(value: Any) -> torch.Tensor:
-        if isinstance(value, tuple):
-            value = value[0]
-        if not isinstance(value, torch.Tensor):
-            raise TypeError(
-                f"Expected kv_b_proj to return Tensor, got {type(value)!r}."
-            )
-        return value
-
     def _infer_num_heads(self, q: torch.Tensor) -> int:
         num_heads = int(q.shape[1])
         if self.num_heads != num_heads:
