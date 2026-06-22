@@ -378,17 +378,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             or int(getattr(kv_cache, "seq_size_per_block", 0))
             or 1
         )
-        seq_size_per_block = (
-            int(getattr(kv_cache, "seq_size_per_block", 0))
-            or kernel_seq_size_per_block
-            or 1
-        )
         max_blocks = (
             int(max_seq_len) + kernel_seq_size_per_block - 1
         ) // kernel_seq_size_per_block + 1
-        physical_max_blocks = (
-            int(max_seq_len) + seq_size_per_block - 1
-        ) // seq_size_per_block
         # query_start_loc for decode: always [0, 1, 2, ..., bs], i.e. arange(bs+1).
         # seq_id for decode slot_mapping: seq_id[i] == i, i.e. arange(bs).
         self._cg_meta_bufs: dict = {
@@ -396,7 +388,6 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
                 0, max_bs + 1, device=device, dtype=torch.int32
             ),
             "seq_id": torch.arange(0, max_bs, device=device, dtype=torch.int64),
-            "seq_id_i32": torch.arange(0, max_bs, device=device, dtype=torch.int32),
             "block_col": torch.empty(max_bs, device=device, dtype=torch.int32),
             "block_col_i64": torch.empty(max_bs, device=device, dtype=torch.int64),
             "slot_base": torch.empty(max_bs, device=device, dtype=torch.int32),
@@ -406,16 +397,12 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             "block_table_i32": torch.empty(
                 max_bs, max_blocks, device=device, dtype=torch.int32
             ),
-            "physical_block_table_i32": torch.empty(
-                max_bs, max(physical_max_blocks, 1), device=device, dtype=torch.int32
-            ),
         }
         self._cg_layers_prewarmed = True
         logger.info(
             "ATOM RTPFullAttention cuda-graph prewarmed for %d layers "
             "(max_num_tokens=%d, max_seq_len=%d, rtp_kv_heads=%s, "
-            "meta_bufs: query_start_loc[%d], slot_mapping[%d], block_table_i32[%dx%d], "
-            "physical_block_table_i32[%dx%d])",
+            "meta_bufs: query_start_loc[%d], slot_mapping[%d], block_table_i32[%dx%d])",
             len(self._atom_attn_pyobj._rtp_full_attn_layers),
             max_num_tokens,
             max_seq_len,
@@ -424,8 +411,6 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             max_bs,
             max_bs,
             max_blocks,
-            max_bs,
-            max(physical_max_blocks, 1),
         )
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
