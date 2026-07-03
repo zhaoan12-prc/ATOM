@@ -174,6 +174,15 @@ def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
     )
 
 
+def _is_neox_rope_style(
+    config: PretrainedConfig, interleave_attr: str, default_interleave: bool
+) -> bool:
+    interleave = getattr(config, interleave_attr, default_interleave)
+    if interleave is None:
+        interleave = default_interleave
+    return not bool(interleave)
+
+
 def _can_fuse_indexer_wk_weights_proj(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
@@ -1822,7 +1831,7 @@ class DeepseekV2MLAAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            is_neox_style=False,
+            is_neox_style=_is_neox_rope_style(config, "rope_interleave", True),
         )
         if rope_scaling:
             mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
@@ -1888,6 +1897,12 @@ class DeepseekV2MLAAttention(nn.Module):
             kv_b_proj=self.kv_b_proj,
             o_proj=self.o_proj,
             indexer=self.indexer,
+            # v3.2 / GLM-5.2 runs sparse MLA on every layer. For GLM-5.2 IndexShare
+            # "shared" layers self.indexer is None, but they must still run sparse
+            # attention and reuse the prior full layer's top-k, so flag sparsity at
+            # the model level rather than per-layer.
+            is_sparse=self.is_v32,
+            topk_tokens=(config.index_topk if self.is_v32 else None),
         )
 
         self.mla_attn = Attention(
