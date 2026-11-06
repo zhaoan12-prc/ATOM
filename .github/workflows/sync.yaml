@@ -1,0 +1,111 @@
+name: Sync ROCm/ATOM to zhaoan12-prc/ATOM
+
+on:
+  schedule:
+    # UTC timezone 01:00-14:00 (Beijing timezone Mon-Fri 9:00-22:00), every 10 minutes
+    - cron: '*/10 1-14 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  sync-main:
+    runs-on: cpu-only
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout zhaoan12-prc/ATOM
+        uses: actions/checkout@v4
+        with:
+          repository: zhaoan12-prc/ATOM
+          token: ${{ secrets.PUSH_TO_MAIN || github.token }}
+          fetch-depth: 10
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "Zhao An"
+          git config --global user.email "zhao.an@amd.com"
+
+      - name: Add ROCm/ATOM upstream remote
+        run: |
+          git remote add upstream https://github.com/ROCm/ATOM.git || true
+          git remote -v
+
+      - name: Check if origin has main branch
+        id: check_main
+        run: |
+          if git ls-remote --heads origin main | grep -q 'refs/heads/main$'; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch and checkout main if exists
+        if: steps.check_main.outputs.exists == 'true'
+        run: |
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
+
+      - name: Create and checkout main if not exists
+        if: steps.check_main.outputs.exists == 'false'
+        run: |
+          git checkout -b main
+
+      - name: Check if sync is needed
+        id: check_sync
+        run: |
+          git fetch upstream main
+          UPSTREAM_COMMIT=$(git rev-parse upstream/main)
+          CURRENT_COMMIT=$(git rev-parse HEAD)
+          echo "UPSTREAM_COMMIT: $UPSTREAM_COMMIT"
+          echo "CURRENT_COMMIT: $CURRENT_COMMIT"
+
+          if [ "$CURRENT_COMMIT" = "$UPSTREAM_COMMIT" ]; then
+            echo "Already synced with upstream/main"
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PARENT_COMMIT=$(git rev-parse --verify HEAD^ 2>/dev/null || echo "")
+          echo "PARENT_COMMIT: $PARENT_COMMIT"
+          if [ "$PARENT_COMMIT" = "$UPSTREAM_COMMIT" ]; then
+            COMMIT_MSG=$(git log -1 --pretty=%B)
+            if echo "$COMMIT_MSG" | grep -q "\[CI\]\[AMD\] add ATOM sync workflow"; then
+              echo "Already synced with upstream/main and ATOM sync workflow"
+              echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "Need to sync with upstream/main"
+          echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+
+      - name: Sync with ROCm/ATOM and keep sync workflow
+        if: steps.check_sync.outputs.needs_sync == 'true'
+        run: |
+          SYNC_WORKFLOW=$(mktemp)
+          trap 'rm -f "$SYNC_WORKFLOW"' EXIT
+          cp .github/workflows/sync.yaml "$SYNC_WORKFLOW"
+
+          git fetch upstream main
+          git reset --hard upstream/main
+
+          # Keep only this sync workflow so upstream workflows are not run in zhaoan12-prc/ATOM.
+          mkdir -p .github/workflows
+          rm -f .github/workflows/*.yaml
+          rm -f .github/workflows/*.yml
+          cp "$SYNC_WORKFLOW" .github/workflows/sync.yaml
+
+          git add -A .github/workflows
+          if git diff --cached --quiet; then
+            echo "No workflow changes to commit"
+          else
+            git commit -m '[CI][AMD] add ATOM sync workflow'
+          fi
+
+          git push --set-upstream origin main --force
